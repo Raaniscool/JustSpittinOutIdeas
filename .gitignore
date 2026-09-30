@@ -1,0 +1,9 @@
+node_modules/
+dist/
+web/dist/
+data/*.json
+data/*.log
+*.log
+.env
+.DS_Store
+.cache/

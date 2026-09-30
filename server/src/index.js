@@ -31,6 +31,9 @@ app.use((req, res, next) => {
 
 app.use('/api', apiRouter(ctx));
 
+// Unknown API paths must answer as JSON, not fall through to the SPA shell.
+app.use('/api', (req, res) => res.status(404).json({ error: `no such endpoint: ${req.method} ${req.originalUrl}` }));
+
 // ------------------------------------------------------------------- SSE ----
 app.get(['/events', '/api/events'], (req, res) => {
   res.writeHead(200, {
@@ -78,21 +81,31 @@ app.get(['/events', '/api/events'], (req, res) => {
 
 // ------------------------------------------------------------- static UI ----
 const distDir = path.join(ROOT, 'web', 'dist');
+
+const devHintPage = (reason) => `<!doctype html><html><body style="font-family:ui-sans-serif,system-ui;background:#070a10;color:#e7eef8;padding:48px;max-width:720px;margin:0 auto">
+<h1 style="font-size:20px">⚗ IdeaLab API is running</h1>
+<p style="color:#a8b6c9">${reason}</p>
+<pre style="background:#0f141d;border:1px solid #1e2735;border-radius:10px;padding:14px;overflow:auto">npm install     # once
+npm run dev     # UI on :5173 with hot reload, API on :8787
+# or
+npm start       # builds the UI and serves everything from :8787</pre>
+<p style="color:#6f7f95;font-size:13px">API is live: <a style="color:#58d3ff" href="/api/health">/api/health</a> &middot;
+<a style="color:#58d3ff" href="/api/ideas?limit=5">/api/ideas</a> &middot;
+<a style="color:#58d3ff" href="/api/stats">/api/stats</a> &middot;
+<a style="color:#58d3ff" href="/events">/events</a></p>
+</body></html>`;
+
 if (fs.existsSync(distDir)) {
   app.use(express.static(distDir, { maxAge: '1h', index: 'index.html' }));
-  app.get('*', (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
+  app.get('*', (_req, res) => {
+    // Checked per request: if the build directory disappears while the server is
+    // running, say so instead of serving a blank page.
+    if (fs.existsSync(path.join(distDir, 'index.html'))) return res.sendFile(path.join(distDir, 'index.html'));
+    res.status(503).type('html').send(devHintPage('The compiled UI is missing (web/dist was removed). Run <code>npm run build</code>, or use <code>npm run dev</code>.'));
+  });
 } else {
-  app.get('/', (_req, res) =>
-    res
-      .status(200)
-      .type('html')
-      .send(
-        `<html><body style="font-family:ui-sans-serif;background:#0b0e14;color:#e6edf7;padding:40px">
-        <h1>IdeaLab API is running</h1>
-        <p>The UI has not been built yet. Run <code>npm run dev</code> for the dev server, or <code>npm run build &amp;&amp; npm start</code>.</p>
-        <p>API: <a style="color:#7ee787" href="/api/health">/api/health</a> &middot; <a style="color:#7ee787" href="/api/stats">/api/stats</a></p>
-        </body></html>`,
-      ),
+  app.get('*', (_req, res) =>
+    res.status(200).type('html').send(devHintPage('The UI has not been built yet.')),
   );
 }
 

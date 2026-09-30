@@ -97,6 +97,8 @@ export default function SettingsPanel({ settings, onPatch, onReset, health, onPr
             hint="Batching amortises prompt processing. Too high and small models lose coherence." />
           <Num label="Concurrent evaluations" value={perf.evaluateConcurrency} onChange={(v) => setPerf({ evaluateConcurrency: v })} min={1} max={16}
             hint="Match OLLAMA_NUM_PARALLEL. Higher = more ideas scored per minute, until the GPU saturates." />
+          <Num label="Concurrent deep actions" value={perf.deepConcurrency ?? 2} onChange={(v) => setPerf({ deepConcurrency: v })} min={1} max={8}
+            hint="Deep mode only: attack + improve per idea, bounded separately from the evaluation pool." />
           <Num label="num_ctx (generate)" value={perf.numCtxGenerate} onChange={(v) => setPerf({ numCtxGenerate: v })} min={512} max={65536} step={256} />
           <Num label="num_ctx (evaluate)" value={perf.numCtxEvaluate} onChange={(v) => setPerf({ numCtxEvaluate: v })} min={512} max={65536} step={256} />
           <Num label="num_ctx (deep actions)" value={perf.numCtxDeep} onChange={(v) => setPerf({ numCtxDeep: v })} min={512} max={65536} step={256} />

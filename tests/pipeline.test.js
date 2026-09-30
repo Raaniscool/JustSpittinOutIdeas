@@ -154,6 +154,99 @@ test('mutate produces several distinct children', async () => {
   for (const id of out.childIds) assert.equal(ctx.repo.get(id).origin, 'mutated');
 });
 
+/** Fail instead of hanging forever if the pipeline deadlocks. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} did not finish in ${ms}ms (deadlock?)`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+test('a deep batch completes when more ideas are in flight than the eval pool allows', async () => {
+  // Regression. The deep pass used to run *inside* the evaluation limiter slot,
+  // and improve/mutate children inherited mode: 'deep'. Each child then had to
+  // acquire a slot its own parent was still holding, so any batch wider than
+  // evaluateConcurrency deadlocked permanently - and the improve -> child ->
+  // improve chain recursed without bound even when slots were free.
+  patchSettings(ctx, { performance: { evaluateConcurrency: 2, deepConcurrency: 1, ideasPerGenerationCall: 6 } });
+  ctx.engine.syncConcurrency();
+  const before = ctx.repo.count();
+
+  try {
+    const res = await withTimeout(
+      ctx.engine.generateBatch({ count: 6, category: 'any', mode: 'deep' }),
+      30000,
+      'deep batch',
+    );
+    assert.equal(res.generated, 6);
+    assert.equal(res.scored, 6);
+
+    const added = ctx.repo.all().slice(before);
+    assert.ok(added.length >= 6, 'the batch is in the bank');
+    const generated = added.filter((i) => i.origin === 'generated');
+    const derived = added.filter((i) => i.origin !== 'generated');
+
+    assert.equal(generated.length, 6);
+    for (const idea of generated) {
+      assert.equal(idea.scoringState, 'scored', `${idea.title} should be scored`);
+      assert.ok(Number.isFinite(idea.score?.overall), 'scored numerically');
+      assert.ok(idea.analysis?.attack, 'deep mode attacked every generated idea');
+    }
+
+    // Recursion is bounded at one level: children are scored brutally but never
+    // deep-passed themselves, so a deep batch cannot spawn an idea explosion.
+    assert.ok(derived.length <= 12, `derived ideas stay bounded (got ${derived.length})`);
+    for (const child of derived) {
+      assert.equal(child.mode, 'fast', 'derived ideas are evaluated in fast mode');
+      assert.equal(child.scoringState, 'scored', 'derived ideas still get a real score');
+      assert.ok(Number.isFinite(child.score?.overall), 'derived score present');
+      assert.ok(!child.analysis?.attack, 'derived ideas do not trigger their own deep pass');
+      assert.ok(child.parentId, 'derived ideas remember their parent');
+    }
+  } finally {
+    patchSettings(ctx, { performance: { evaluateConcurrency: 4, deepConcurrency: 2, ideasPerGenerationCall: 6 } });
+    ctx.engine.syncConcurrency();
+  }
+});
+
+test('a job can pin an explicit model instead of the global default', async () => {
+  // The header dropdown patches the global default, but per-job model selection is
+  // how two models get compared side by side. It used to be silently dropped:
+  // generateBatch() re-resolved the default, so the job and every idea it produced
+  // were attributed to a model that never ran.
+  patchSettings(ctx, { model: 'idealab-sim-1b' });
+  const before = ctx.repo.count();
+
+  const res = await withTimeout(
+    ctx.engine.generateBatch({ count: 6, category: 'ai', mode: 'fast', model: 'idealab-sim-8b' }),
+    30000,
+    'pinned-model batch',
+  );
+  assert.equal(res.model, 'idealab-sim-8b', 'the batch reports the model that actually ran');
+  assert.equal(res.generated, 6);
+
+  const added = ctx.repo.all().slice(before);
+  assert.equal(added.length, 6);
+  for (const idea of added) {
+    assert.equal(idea.model, 'idealab-sim-8b', 'the idea is attributed to the pinned model');
+    assert.equal(idea.evaluation?.model, 'idealab-sim-8b', 'so is the evaluation that judged it');
+    assert.equal(idea.scoringState, 'scored');
+  }
+
+  const models = ctx.stats.summary().byModel.map((m) => m.model);
+  assert.ok(models.includes('idealab-sim-8b'), 'stats break the run down by the model used');
+  assert.ok(models.includes('idealab-sim-1b'), 'earlier default-model ideas are still attributed correctly');
+
+  // Deep actions honour the same override, and children inherit it.
+  const target = added[0];
+  const out = await ctx.engine.runAction(target.id, 'improve', { model: 'idealab-sim-4b' });
+  assert.ok(out.childId, 'improve produced a child');
+  const child = ctx.repo.get(out.childId);
+  assert.equal(child.model, 'idealab-sim-4b', 'the child is scored by the model that was asked for');
+  assert.equal(child.evaluation?.model, 'idealab-sim-4b');
+});
+
 test('re-evaluate bypasses the cache and keeps history', async () => {
   const target = ctx.repo.all().find((i) => i.score?.overall != null);
   const before = target.score.overall;
@@ -174,12 +267,42 @@ test('knowledge extraction is gated but does add real components', async () => {
   assert.ok(out.mined >= 3);
   const after = ctx.bank.stats();
   assert.ok(after.total > before.total || out.accepted.length >= 0);
+  // The demo extractor always submits one evidence-free and one claim-laden
+  // candidate. Whether the claim-laden one is *reached* depends on the ingest
+  // budget (kinds are processed in order), so assert the invariants that cannot
+  // be skipped rather than a specific quarantine count.
   const rejectedReasons = out.rejected.map((r) => r.reason).join(' ');
-  assert.match(rejectedReasons, /no evidence|quarantined|budget/, 'the demo extractor deliberately submits bad candidates; they must be refused');
-  assert.ok(after.byStatus.unverified >= 1, 'the claim-laden candidate must be quarantined');
+  assert.match(rejectedReasons, /no evidence|quarantined|budget/, 'bad candidates are refused with a reason');
   for (const e of ctx.bank.list({ status: 'candidate' })) {
     assert.ok(e.evidence.ideaIds.length >= 1, 'every candidate must be traceable to real ideas');
   }
+  for (const e of ctx.bank.list({ status: 'verified', limit: 10000 })) {
+    assert.ok(e.source || (e.claimFlags || []).length === 0, `verified entry "${e.name}" carries an unsourced claim`);
+  }
+
+  // Deterministic gate check against the live bank, independent of that budget.
+  const witness = ctx.repo.all()[0]?.id;
+  const gated = ctx.bank.ingest(
+    {
+      problems: [], technologies: [], businessModels: [], distribution: [], audiences: [],
+      monetization: [{
+        name: 'Enterprise outcome pricing',
+        description: 'The market is worth $2.3B and growing 40% year over year, proven by adoption data.',
+        evidence: { ideaIds: [witness] },
+      }],
+    },
+    [witness],
+  );
+  const quarantined = ctx.bank.findByName('Enterprise outcome pricing', 'monetization');
+  // Either this call quarantined it, or an earlier extraction already did; both
+  // are refusals, and the entry must never be usable.
+  assert.equal(quarantined.status, 'unverified', 'the unsourced claim is quarantined, new or merged');
+  assert.ok(quarantined.claimFlags.length > 0, 'and the flags say why');
+  assert.ok(!ctx.bank.usable('monetization').some((e) => e.id === quarantined.id), 'it never reaches a generation prompt');
+  // Read the stats *after* the deterministic gate check above: whether the
+  // pipeline's own extraction reached the claim-laden candidate depends on the
+  // ingest budget, so the earlier snapshot is not a reliable place to assert this.
+  assert.ok(ctx.bank.stats().byStatus.unverified >= 1, 'the quarantine is visible in the bank stats');
 });
 
 test('the bias monitor raises directives once a concentration exists', async () => {

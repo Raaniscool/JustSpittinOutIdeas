@@ -34,6 +34,8 @@ export const DEFAULT_SETTINGS = {
   performance: {
     ideasPerGenerationCall: envInt(process.env.IDEALAB_BATCH, 6), // batch generation
     evaluateConcurrency: envInt(process.env.IDEALAB_EVAL_CONCURRENCY, 3),
+    // deep mode only: attack + improve (+ children) per idea, bounded separately
+    deepConcurrency: envInt(process.env.IDEALAB_DEEP_CONCURRENCY, 2),
     generateConcurrency: envInt(process.env.IDEALAB_GEN_CONCURRENCY, 1),
     numCtxGenerate: envInt(process.env.IDEALAB_CTX_GEN, 3072),
     numCtxEvaluate: envInt(process.env.IDEALAB_CTX_EVAL, 2048),

@@ -113,6 +113,81 @@ test('a supported extraction becomes a candidate, then verified on second suppor
   assert.ok(bank.usable('problem').some((e) => e.id === promoted.id));
 });
 
+test('a manual entry with an unsourced claim is quarantined at once', () => {
+  const bank = freshBank();
+  // The API stores manual entries without a source as 'candidate', and a candidate
+  // is one evidence merge away from 'verified'.
+  const { entry } = bank.add(
+    { kind: 'monetization', name: 'Usage pricing for lab equipment', description: 'A $4B market growing 35% a year, obviously.' },
+    { origin: 'manual', status: 'candidate' },
+  );
+  assert.equal(entry.status, 'unverified', 'quarantined rather than left promotable');
+  assert.ok(entry.claimFlags.length > 0);
+  assert.ok(!bank.usable('monetization').some((e) => e.id === entry.id));
+});
+
+test('legacy data cannot be laundered into the pool by new evidence', () => {
+  // Entries written by an older build could sit at 'candidate' while carrying
+  // unsourced claims. The merge path re-checks them, so stale data on disk cannot
+  // be promoted into the components generation is seeded from.
+  const bank = freshBank();
+  const name = 'Legacy outcome pricing claim';
+  bank.ingest(
+    {
+      problems: [], technologies: [], businessModels: [], distribution: [], audiences: [],
+      monetization: [{ name, description: 'Charged against a measured outcome.', evidence: { ideaIds: ['idea-1'] } }],
+    },
+    ['idea-1'],
+  );
+  const legacy = bank.findByName(name, 'monetization');
+  assert.equal(legacy.status, 'candidate');
+  // emulate the pre-gate state: a candidate whose text carries an unsourced claim
+  legacy.description = 'Worth $2.3B and growing 40% year over year.';
+  legacy.claimFlags = detectClaims(legacy);
+  assert.ok(legacy.claimFlags.length > 0, 'sanity: the claim is detectable');
+
+  const out = bank.ingest(
+    {
+      problems: [], technologies: [], businessModels: [], distribution: [], audiences: [],
+      monetization: [{ name, description: 'Seen again in a second idea.', evidence: { ideaIds: ['idea-2'] } }],
+    },
+    ['idea-2'],
+  );
+  const after = bank.findByName(name, 'monetization');
+  assert.deepEqual(out.promoted, [], 'second corroboration does not promote it');
+  assert.equal(after.status, 'unverified', 'it is quarantined instead');
+  assert.match(out.rejected.map((r) => r.reason).join(' '), /quarantined on merge/, 'and the refusal is explained');
+  assert.ok(!bank.usable('monetization').some((e) => e.id === after.id));
+});
+
+test('corroboration never promotes an entry carrying an unsourced claim', () => {
+  const bank = freshBank();
+  const name = 'Per-outcome pricing for compliance work';
+  const extraction = (ideaId, description) => ({
+    problems: [], technologies: [], businessModels: [], distribution: [], audiences: [],
+    monetization: [{ name, description, evidence: { ideaIds: [ideaId] } }],
+  });
+
+  bank.ingest(extraction('idea-1', 'Charged against a measured compliance outcome.'), ['idea-1']);
+  const entry = bank.findByName(name, 'monetization');
+  assert.equal(entry.status, 'candidate', 'clean text from one idea is a candidate');
+
+  // Someone edits a market number into it without citing anything.
+  bank.update(entry.id, { description: 'Worth $2.3B and growing 40% year over year, proven by adoption data.' });
+  assert.equal(bank.findByName(name, 'monetization').status, 'unverified', 'editing in an unsourced claim quarantines it');
+
+  // A second idea corroborating the *component* must not launder the claim.
+  const out = bank.ingest(extraction('idea-2', 'Seen again in a second idea.'), ['idea-2']);
+  const after = bank.findByName(name, 'monetization');
+  assert.equal(after.supportCount, 2, 'the evidence did merge');
+  assert.equal(after.status, 'unverified', 'two ideas repeating a number is still not a source');
+  assert.deepEqual(out.promoted, [], 'nothing was promoted');
+  assert.ok(!bank.usable('monetization').some((e) => e.id === after.id), 'it must never seed a prompt');
+
+  // Citing a real source is still the way out.
+  assert.equal(bank.promote(after.id, { byUser: true, source: 'Gartner outcome-pricing survey, 2025' }).status, 'verified');
+});
+
 test('a human can promote a quarantined entry by supplying a source', () => {
   const bank = freshBank();
   const { entry } = bank.add(

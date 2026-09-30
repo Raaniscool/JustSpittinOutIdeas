@@ -128,7 +128,11 @@ export class KnowledgeBank {
     const flags = detectClaims(entry);
     if (flags.length && !entry.source) {
       entry.claimFlags = flags;
-      if (status === 'verified') entry.status = 'unverified';
+      // Whatever status was asked for, an unsourced claim is quarantined. The API
+      // adds manual entries without a source as 'candidate', and a candidate is
+      // one evidence merge away from 'verified' - which is how a made-up market
+      // size used to reach the prompts that seed generation.
+      entry.status = 'unverified';
     }
     this.entries.set(entry.id, entry);
     this.#commit();
@@ -142,7 +146,11 @@ export class KnowledgeBank {
     next.name = String(next.name || entry.name).slice(0, 90);
     const flags = detectClaims(next);
     next.claimFlags = flags;
-    if (flags.length && !next.source && next.status === 'verified') next.status = 'unverified';
+    // Editing an entry to add an unsupported claim has to demote it whatever its
+    // current status. Only demoting 'verified' left a hole: a 'candidate' edited
+    // to claim "$5B market, 40% growth" kept its status and the next evidence
+    // merge promoted it into the pool generation draws from.
+    if (flags.length && !next.source && next.status !== 'unverified') next.status = 'unverified';
     this.entries.set(id, next);
     this.#commit();
     return next;
@@ -226,7 +234,20 @@ export class KnowledgeBank {
           const before = existing.supportCount;
           existing.evidence.ideaIds = [...new Set([...existing.evidence.ideaIds, ...ids])].slice(0, 40);
           existing.supportCount = existing.evidence.ideaIds.length;
-          if (existing.status === 'candidate' && existing.supportCount >= 2) {
+          // Re-check claims before promoting: repeated corroboration of a number
+          // is not a source for it. Two ideas repeating "$2.3B market" still does
+          // not make it true, so it stays out of the usable pool.
+          const mergeFlags = detectClaims(existing);
+          existing.claimFlags = mergeFlags;
+          const promotable = existing.status === 'candidate' && existing.supportCount >= 2;
+          if (promotable && mergeFlags.length && !existing.source) {
+            existing.status = 'unverified';
+            rejected.push({
+              name: existing.name,
+              kind,
+              reason: `quarantined on merge: unsupported claim (${mergeFlags.join(', ')}). Corroboration is not a source - add one to promote it.`,
+            });
+          } else if (promotable) {
             existing.status = 'verified';
             promoted.push(existing.name);
           }

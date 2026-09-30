@@ -125,6 +125,11 @@ export class IdeaEngine {
     this.evalCache = new TtlCache({ max: 8000, ttlMs: deps.settingsStore.data?.performance?.evalCacheTtlMs || 1000 * 60 * 60 * 12 });
     this.evalLimiter = createLimiter(this.settings.performance?.evaluateConcurrency || 3);
     this.limiterConcurrency = this.settings.performance?.evaluateConcurrency || 3;
+    // Deep passes run outside the evaluation pool (see ingest), so they get their
+    // own bound: attack+improve per idea must not become a burst of unbounded
+    // concurrent requests against a local model that serialises anyway.
+    this.deepLimiter = createLimiter(this.deepConcurrency());
+    this.limiterDeepConcurrency = this.deepConcurrency();
     this._loadedModel = null;
     this._modelCache = { at: 0, model: null };
     this.inFlight = 0;
@@ -134,12 +139,23 @@ export class IdeaEngine {
     return this.settingsStore.data;
   }
 
-  /** Rebuild the concurrency limiter when the user changes it. */
+  deepConcurrency() {
+    const want = this.settings.performance?.deepConcurrency;
+    const n = Number.isFinite(Number(want)) && Number(want) > 0 ? Number(want) : 2;
+    return Math.max(1, Math.min(n, this.settings.performance?.evaluateConcurrency || 3));
+  }
+
+  /** Rebuild the concurrency limiters when the user changes them. */
   syncConcurrency() {
     const want = this.settings.performance?.evaluateConcurrency || 3;
     if (want !== this.limiterConcurrency) {
       this.limiterConcurrency = want;
       this.evalLimiter = createLimiter(want);
+    }
+    const wantDeep = this.deepConcurrency();
+    if (wantDeep !== this.limiterDeepConcurrency) {
+      this.limiterDeepConcurrency = wantDeep;
+      this.deepLimiter = createLimiter(wantDeep);
     }
   }
 
@@ -147,7 +163,13 @@ export class IdeaEngine {
     return getProvider(this.settings.provider || 'ollama');
   }
 
-  async resolveModel() {
+  /**
+   * Which model to use: an explicit request (per job / per action) wins, then the
+   * configured default, then the first model the provider reports.
+   */
+  async resolveModel(explicit = '') {
+    const wanted = typeof explicit === 'string' ? explicit.trim() : explicit;
+    if (wanted) return wanted;
     const configured = this.settings.model;
     if (configured) return configured;
     if (this._modelCache.model && Date.now() - this._modelCache.at < 30000) return this._modelCache.model;
@@ -181,9 +203,9 @@ export class IdeaEngine {
   }
 
   /** Single funnel for every model call: timing, retries, stats. */
-  async callModel({ role, schema, prompt, budget = 'evaluate', budgetOverride, signal, onToken, onItem, itemArrayKey }) {
+  async callModel({ role, schema, prompt, budget = 'evaluate', budgetOverride, signal, onToken, onItem, itemArrayKey, model: requestedModel = '' }) {
     const provider = this.provider();
-    const model = await this.resolveModel();
+    const model = await this.resolveModel(requestedModel);
     const system = ROLES[role] || ROLES.evaluator;
     const opts = this.budgetFor(budget, budgetOverride);
     let emitted = 0;
@@ -247,12 +269,13 @@ export class IdeaEngine {
     mode = 'fast',
     jobId = null,
     signal,
+    model: requestedModel = '',
     shouldContinue = () => true,
   } = {}) {
     const started = performance.now();
     const s = this.settings;
     const provider = this.provider();
-    const model = await this.resolveModel();
+    const model = await this.resolveModel(requestedModel);
     if (!model) {
       throw new ProviderError(
         this.settings.provider === 'demo'
@@ -294,6 +317,7 @@ export class IdeaEngine {
       schema: GENERATE_SCHEMA,
       prompt,
       budget: 'generate',
+      model,
       signal,
       itemArrayKey: 'ideas',
       onItem: (raw) => {
@@ -384,6 +408,18 @@ export class IdeaEngine {
 
     try {
       await this.evalLimiter(() => this.score(record, { model, signal, mode }));
+      // Deep work runs *after* the limiter slot is released. Attack/improve spawn
+      // child ideas that need an evaluation slot of their own, so nesting the
+      // deep pass inside the parent's slot deadlocks the pool the moment as many
+      // ideas are in flight as `evaluateConcurrency` allows.
+      //
+      // Derived ideas are never deep either: one level of improve/mutate is the
+      // useful amount, and letting a child inherit `deep` recursed without bound
+      // (improve -> child -> improve -> grandchild -> ...).
+      if (mode === 'deep' && origin === 'generated') {
+        const scored = this.repo.get(record.id) || record;
+        if (scored.scoringState !== 'failed') await this.deepLimiter(() => this.deepPass(scored, { signal }));
+      }
       return { ok: true, id: record.id, overall: record.score?.overall };
     } catch (err) {
       record.scoringState = 'failed';
@@ -399,8 +435,13 @@ export class IdeaEngine {
    * Fast-mode evaluation: one independent evaluator call per idea, with
    * cache + near-duplicate reuse to avoid unnecessary model calls.
    */
-  async score(idea, { model = '', signal, mode = 'fast', force = false } = {}) {
+  async score(idea, { model: requestedModel = '', signal, mode = 'fast', force = false } = {}) {
     const started = performance.now();
+    // Resolve once, before anything keys off it, so the model recorded on the
+    // evaluation is the model that actually produced it: an idea generated by an
+    // explicit per-job model must not be evaluated by whatever the global default
+    // happens to be now.
+    const model = await this.resolveModel(requestedModel || idea.model || '');
     const s = this.settings;
     const calib = s.scoring?.calibration || {};
     const weights = this.weights();
@@ -437,7 +478,7 @@ export class IdeaEngine {
     let callMs = 0;
     if (!raw) {
       const prompt = buildEvaluatePrompt(idea, { calibrationDirective: this.calibration.directive() });
-      const res = await this.callModel({ role: 'evaluator', schema: EVALUATE_SCHEMA, prompt, budget: 'evaluate', signal });
+      const res = await this.callModel({ role: 'evaluator', schema: EVALUATE_SCHEMA, prompt, budget: 'evaluate', model, signal });
       raw = res.object;
       usage = res.usage;
       callMs = res.ms;
@@ -484,7 +525,6 @@ export class IdeaEngine {
     this.stats.recordEvaluation({ ms, model, overall, usage, cacheHit: reuse?.kind === 'cache', duplicateSkip: reuse?.kind === 'near-duplicate' });
     emit('idea:scored', { card: IdeaRepository.card(idea), jobId: idea.jobId });
 
-    if (mode === 'deep') await this.deepPass(idea, { signal });
     return { ok: true, overall, ms, reuse };
   }
 
@@ -502,10 +542,13 @@ export class IdeaEngine {
   // Exploration actions
   // -----------------------------------------------------------------------
 
-  async runAction(ideaId, action, { signal, silent = false } = {}) {
+  async runAction(ideaId, action, { signal, silent = false, model: requestedModel = '' } = {}) {
     const idea = this.repo.get(ideaId);
     if (!idea) throw new ProviderError(`Unknown idea ${ideaId}`, { code: 'not-found' });
     const started = performance.now();
+    // One model for the whole action, so the analysis and any child ideas are all
+    // attributed to the model that actually produced them.
+    const model = await this.resolveModel(requestedModel);
     const evaluation = idea.evaluation || {};
     const payloadForEval = {
       overall: idea.score?.overall,
@@ -523,6 +566,7 @@ export class IdeaEngine {
           schema: ATTACK_SCHEMA,
           prompt: buildAttackPrompt(idea, payloadForEval),
           budget: 'deep',
+          model,
           signal,
         });
         result = { attack: res.object };
@@ -535,6 +579,7 @@ export class IdeaEngine {
           schema: IMPROVE_SCHEMA,
           prompt: buildImprovePrompt(idea, { evaluation: payloadForEval, attack: idea.analysis?.attack }),
           budget: 'deep',
+          model,
           signal,
         });
         const improved = res.object || {};
@@ -553,9 +598,9 @@ export class IdeaEngine {
             distribution: idea.distribution,
           });
           const created = await this.ingest(child, {
-            model: idea.model,
+            model,
             providerId: idea.provider,
-            mode: idea.mode || 'fast',
+            mode: 'fast', // derived ideas are scored, never deep-passed (see ingest)
             signal,
             origin: 'improved',
             parentId: idea.id,
@@ -571,6 +616,7 @@ export class IdeaEngine {
           schema: MUTATE_SCHEMA,
           prompt: buildMutatePrompt(idea, { count: 3 }),
           budget: 'deep',
+          model,
           signal,
         });
         const variants = (res.object?.variants || []).slice(0, 4);
@@ -580,9 +626,9 @@ export class IdeaEngine {
           const child = normalizeIdea(v);
           if (!isViableIdea(child)) continue;
           const created = await this.ingest(child, {
-            model: idea.model,
+            model,
             providerId: idea.provider,
-            mode: idea.mode || 'fast',
+            mode: 'fast', // derived ideas are scored, never deep-passed (see ingest)
             signal,
             origin: 'mutated',
             parentId: idea.id,
@@ -598,6 +644,7 @@ export class IdeaEngine {
           schema: DEVELOP_SCHEMA,
           prompt: buildDevelopPrompt(idea, { evaluation: payloadForEval }),
           budget: 'deep',
+          model,
           signal,
         });
         idea.analysis = { ...(idea.analysis || {}), develop: { ...res.object, at: Date.now(), model: res.model } };
@@ -610,6 +657,7 @@ export class IdeaEngine {
           schema: RESEARCH_SCHEMA,
           prompt: buildResearchPrompt(idea, { evaluation: payloadForEval }),
           budget: 'deep',
+          model,
           signal,
         });
         idea.analysis = { ...(idea.analysis || {}), research: { ...res.object, at: Date.now(), model: res.model } };
@@ -620,7 +668,7 @@ export class IdeaEngine {
         const previous = idea.evaluation
           ? { overall: idea.score?.overall, factors: idea.evaluation.factors, at: Date.now(), whyNotHigher: idea.evaluation.whyNotHigher }
           : null;
-        await this.score(idea, { model: idea.model || (await this.resolveModel()), signal, force: true });
+        await this.score(idea, { model: model || idea.model, signal, force: true });
         if (previous) {
           idea.analysis = { ...(idea.analysis || {}), history: [...(idea.analysis?.history || []), previous].slice(-8) };
           this.repo.update(idea.id, { analysis: idea.analysis });

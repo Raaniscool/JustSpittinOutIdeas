@@ -107,7 +107,7 @@ export class JobManager {
   }
 
   async #runAction(job) {
-    const res = await this.engine.runAction(job.ideaId, job.action, { signal: job.controller.signal });
+    const res = await this.engine.runAction(job.ideaId, job.action, { signal: job.controller.signal, model: job.model });
     job.scored = res.childIds?.length || (res.childId ? 1 : 0);
     job.batchLog.push({ at: Date.now(), action: job.action, ms: res.ms, children: job.scored });
     emit('job:update', this.public(job));
@@ -132,6 +132,7 @@ export class JobManager {
           count: size,
           category: job.category,
           mode: job.mode,
+          model: job.model,
           jobId: job.id,
           signal: job.controller.signal,
           shouldContinue: () => !job.stopping && !job.paused,

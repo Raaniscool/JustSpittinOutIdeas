@@ -117,6 +117,11 @@ tint and the API can never disagree.
 * **🔬 Deep** — Generate → Evaluate → **Attack** → **Improve** → **Re-evaluate**. Slower, and only worth it
   once something catches your eye.
 
+Improvement is one level deep, deliberately: the ideas an *Improve* or *Mutate* produces are scored brutally but
+are not themselves attacked and improved again. That keeps a deep batch from cascading into an unbounded chain of
+derived ideas, and it means deep passes run outside the evaluation concurrency pool (with their own bound,
+`IDEALAB_DEEP_CONCURRENCY`) rather than holding an evaluation slot while waiting for one.
+
 On any idea you can also run individual actions from the detail drawer:
 
 | Action | What happens |
@@ -231,6 +236,7 @@ initial values:
 | `IDEALAB_MODEL` | *(auto)* | Model id; empty = smallest installed |
 | `IDEALAB_BATCH` | `6` | Ideas per generation call |
 | `IDEALAB_EVAL_CONCURRENCY` | `3` | Concurrent evaluations (match `OLLAMA_NUM_PARALLEL`) |
+| `IDEALAB_DEEP_CONCURRENCY` | `2` | Concurrent deep actions (attack/improve), capped at the eval concurrency |
 | `IDEALAB_CTX_GEN` / `_CTX_EVAL` / `_CTX_DEEP` | `3072 / 2048 / 3072` | `num_ctx` per role |
 | `IDEALAB_MAXTOK_GEN` / `_EVAL` / `_DEEP` | `1400 / 900 / 1200` | `num_predict` caps |
 | `IDEALAB_TEMP_GEN` / `_TEMP_EVAL` | `1.0 / 0.2` | Temperature per role |

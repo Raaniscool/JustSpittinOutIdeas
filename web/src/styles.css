@@ -327,3 +327,60 @@ input[type="number"].weight { width: 62px; text-align: right; font-family: var(-
 @media (max-width: 1080px) {
   .only-narrow { display: inline-flex !important; }
 }
+
+/* ---------------------------------------------------- pipeline strip ----
+   Generation and review are separate stages now, so the strip shows them as
+   separate stages: what is being produced, what is waiting, what is scored. */
+.pipeline-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(88, 211, 255, 0.05), rgba(0, 0, 0, 0));
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.pipeline-strip .stage {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.pipeline-strip .stage.grow { flex: 1 1 260px; }
+.pipeline-strip .stage-icon { opacity: 0.85; font-size: 13px; }
+.pipeline-strip .stage-body { display: flex; flex-direction: column; min-width: 0; }
+.pipeline-strip .stage-body.grow { flex: 1; }
+.pipeline-strip .stage-body b { font-weight: 600; letter-spacing: 0.01em; white-space: nowrap; }
+.pipeline-strip .stage-body .muted {
+  color: var(--ink-3);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pipeline-strip .arrow { color: var(--ink-3); opacity: 0.6; }
+.pipeline-strip .stage-actions { display: flex; gap: 6px; margin-left: auto; }
+.pipeline-strip.tone-warn { background: linear-gradient(180deg, rgba(240, 185, 11, 0.12), rgba(0, 0, 0, 0)); }
+.pipeline-strip.tone-warn .stage-body b { color: var(--warn); }
+.pipeline-strip.tone-bad { background: linear-gradient(180deg, rgba(248, 81, 73, 0.14), rgba(0, 0, 0, 0)); }
+.pipeline-strip.tone-bad .stage-body b { color: var(--bad); }
+.backlog-meter {
+  height: 3px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+  margin-top: 4px;
+  max-width: 320px;
+}
+.backlog-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--warn));
+  transition: width 0.3s ease;
+}
+.pipeline-strip.tone-bad .backlog-fill { background: var(--bad); }
+
+@media (max-width: 900px) {
+  .pipeline-strip .arrow { display: none; }
+  .pipeline-strip .stage-actions { margin-left: 0; width: 100%; }
+}

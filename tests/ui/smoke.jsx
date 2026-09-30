@@ -19,6 +19,7 @@ import IdeaDetail from '../../web/src/components/IdeaDetail.jsx';
 import KnowledgePanel from '../../web/src/components/KnowledgePanel.jsx';
 import BiasPanel from '../../web/src/components/BiasPanel.jsx';
 import StatsPanel from '../../web/src/components/StatsPanel.jsx';
+import PipelineStrip from '../../web/src/components/PipelineStrip.jsx';
 import SettingsPanel from '../../web/src/components/SettingsPanel.jsx';
 import { ScoreBadge, FactorMini, FactorTable, ScoreRamp } from '../../web/src/components/Score.jsx';
 import { scoreColor } from '@shared/scoring.js';
@@ -97,6 +98,47 @@ check('IdeaWall renders a grid of cards and an empty state', () => {
   has(html, 'class="wall', 'Interactive API Documentation Sandbox', 'AI chatbot for recipe ideas', 'end · 3 ideas');
   const empty = renderToStaticMarkup(<IdeaWall items={[]} loading={false} onOpen={noop} onStar={noop} selectedId={null} onGenerate={noop} />);
   has(empty, 'No ideas match this view', 'Generate 10 ideas');
+});
+
+check('the pipeline strip shows generation and review as separate stages', () => {
+  const html = renderToStaticMarkup(
+    <PipelineStrip
+      stats={F.stats}
+      reviews={F.reviews}
+      generating
+      onPauseReviews={noop}
+      onResumeReviews={noop}
+      onClearReviews={noop}
+      onRequeueReviews={noop}
+    />,
+  );
+  has(html, 'pipeline-strip', 'generating', 'awaiting review', 'reviewed/min', '31.4', '12.6');
+  has(html, '9', 'avg wait', 'pause review', 'cap 120');
+  assert.ok(!html.includes('throttled — review'), 'a healthy queue does not warn');
+});
+
+check('the pipeline strip warns when review falls behind or is paused', () => {
+  const throttled = renderToStaticMarkup(
+    <PipelineStrip stats={F.stats} reviews={F.reviewsThrottled} generating onPauseReviews={noop} onResumeReviews={noop} onClearReviews={noop} onRequeueReviews={noop} />,
+  );
+  has(throttled, 'tone-bad', 'generation throttled', 'clear backlog');
+
+  const paused = renderToStaticMarkup(
+    <PipelineStrip stats={F.stats} reviews={F.reviewsPaused} generating={false} onPauseReviews={noop} onResumeReviews={noop} onClearReviews={noop} onRequeueReviews={noop} />,
+  );
+  has(paused, 'tone-warn', 'review paused', 'resume review', 'generator idle');
+
+  const caught = renderToStaticMarkup(
+    <PipelineStrip stats={F.stats} reviews={{ ...F.reviews, depth: 0, active: 0, avgWaitMs: 900 }} generating={false} onPauseReviews={noop} onResumeReviews={noop} onClearReviews={noop} onRequeueReviews={noop} />,
+  );
+  has(caught, 'review is idle');
+});
+
+check('pending ideas render as awaiting review rather than as broken cards', () => {
+  const queued = renderToStaticMarkup(<IdeaCard card={{ ...F.pendingCard, scoringState: 'queued' }} onOpen={noop} onStar={noop} />);
+  has(queued, 'queued for evaluation', 'pending');
+  const scoring = renderToStaticMarkup(<IdeaCard card={F.pendingCard} onOpen={noop} onStar={noop} />);
+  has(scoring, 'evaluating');
 });
 
 check('TopBar exposes provider, model, mode, category, generation controls and live stats', () => {
@@ -195,9 +237,11 @@ check('BiasPanel shows concentration, flags and directives', () => {
 
 check('StatsPanel reports the metrics that matter', () => {
   const html = renderToStaticMarkup(
-    <StatsPanel stats={F.stats} calibration={F.calibration} distribution={F.distribution} evalCache={F.evalCache} model="qwen3:1.7b" provider={{ id: 'ollama' }} onReset={noopAsync} />,
+    <StatsPanel stats={F.stats} calibration={F.calibration} distribution={F.distribution} evalCache={F.evalCache} model="qwen3:1.7b" provider={{ id: 'ollama' }} reviews={F.reviews} onReset={noopAsync} />,
   );
-  has(html, 'Useful ideas / minute', 'Ideas / minute', 'Average generation', 'Average evaluation', 'Average score');
+  has(html, 'Useful ideas / minute', 'Generated / minute', 'Reviewed / minute', 'Average generation', 'Average evaluation', 'Average score');
+  // the two stages are reported separately, with the queue state between them
+  has(html, '31.4', '12.6', '7 waiting', '2 in flight', 'avg wait 4.2s');
   has(html, 'Model comparison', 'qwen3:1.7b', 'llama3.2:3b', 'Calibration health', 'Score colour ramp');
   has(html, '84 entries', '6 hits');
 });
@@ -205,7 +249,7 @@ check('StatsPanel reports the metrics that matter', () => {
 check('SettingsPanel exposes weights, throughput and calibration controls', () => {
   const html = renderToStaticMarkup(<SettingsPanel settings={F.settings} onPatch={noopAsync} onReset={noopAsync} health={F.health} onPreload={noopAsync} onUnload={noopAsync} />);
   has(html, 'Ollama host', 'http://127.0.0.1:11434', 'keep_alive', 'Disable thinking');
-  has(html, 'Ideas per generation call', 'Concurrent evaluations', 'num_ctx', 'Temperature');
+  has(html, 'Ideas per generation call', 'Concurrent review workers', 'Max review backlog', 'num_ctx', 'Temperature');
   has(html, 'Score weights', 'Live score calculator', 'Technical difficulty', 'restore default weights');
   has(html, 'Enforce evidence for high scores', 'Novelty ≥ 7 requires named prior art', 'Auto-strictness');
 });

@@ -14,8 +14,10 @@ const card = (i) => IdeaRepository.card(i);
 
 export function apiRouter(ctx) {
   const r = express.Router();
-  const { repo, bank, stats, calibration, bias, engine, jobs, settingsStore } = ctx;
+  const { repo, bank, stats, calibration, bias, engine, jobs, reviews, settingsStore } = ctx;
   const settings = () => settingsStore.data;
+  const pendingReviewCount = () =>
+    repo.all().filter((i) => i.scoringState === 'queued' || i.scoringState === 'scoring').length;
 
   // ------------------------------------------------------------- system ----
   r.get('/health', async (_req, res) => {
@@ -28,7 +30,9 @@ export function apiRouter(ctx) {
       ollama: ping,
       model: settings().model || (await engine.resolveModel()),
       ideas: repo.count(),
+      pendingReview: pendingReviewCount(),
       job: jobs.active(),
+      reviews: reviews?.snapshot({ limit: 0 }) || null,
       time: Date.now(),
     });
   });
@@ -147,6 +151,18 @@ export function apiRouter(ctx) {
     res.json({ ok: true, jobs: jobs.list() });
   });
 
+  // ------------------------------------------------------------- reviews ----
+  // Evaluation is a separate queue from generation, so it gets its own controls.
+  r.get('/reviews', (_req, res) => {
+    const limit = Math.min(50, Number(_req.query?.limit) || 12);
+    res.json({ ...(reviews?.snapshot({ limit }) || {}), pendingIdeas: pendingReviewCount() });
+  });
+
+  r.post('/reviews/pause', (_req, res) => res.json({ ok: true, reviews: reviews.pause() }));
+  r.post('/reviews/resume', (_req, res) => res.json({ ok: true, reviews: reviews.resume() }));
+  r.post('/reviews/clear', (_req, res) => res.json({ ok: true, ...reviews.clear(), reviews: reviews.snapshot() }));
+  r.post('/reviews/requeue', (_req, res) => res.json({ ok: true, ...reviews.requeue(), reviews: reviews.snapshot() }));
+
   // -------------------------------------------------------------- ideas ----
   r.get('/ideas', (req, res) => {
     const q = req.query;
@@ -247,6 +263,7 @@ export function apiRouter(ctx) {
     const provider = getProvider(settings().provider);
     res.json({
       stats: stats.summary({ elapsedMs: Date.now() - ctx.startedAt }),
+      reviews: reviews?.snapshot() || null,
       calibration: calibration.stats(),
       distribution: repo.distribution(),
       bias: bias.snapshot(),

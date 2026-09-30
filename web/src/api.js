@@ -68,6 +68,13 @@ export const api = {
   promoteKnowledge: (id, source) => req(`/api/knowledge/${id}/promote`, { method: 'POST', body: { source } }),
   deleteKnowledge: (id) => req(`/api/knowledge/${id}`, { method: 'DELETE' }),
   extractKnowledge: (limit = 24) => req('/api/knowledge/extract', { method: 'POST', body: { limit } }),
+
+  // ---- the review queue (evaluation, decoupled from generation) -----------
+  reviews: () => req('/api/reviews'),
+  pauseReviews: () => req('/api/reviews/pause', { method: 'POST' }),
+  resumeReviews: () => req('/api/reviews/resume', { method: 'POST' }),
+  clearReviews: () => req('/api/reviews/clear', { method: 'POST' }),
+  requeueReviews: () => req('/api/reviews/requeue', { method: 'POST' }),
 };
 
 /**
@@ -85,6 +92,9 @@ export function connectEvents(handlers = {}) {
     const types = [
       'snapshot', 'idea:new', 'idea:scored', 'idea:updated', 'job:update', 'job:error',
       'stats', 'calibration', 'bias:update', 'knowledge:update', 'knowledge:usage',
+      // review is its own queue, so it reports its own lifecycle
+      'review:queued', 'review:start', 'review:done', 'review:paused', 'review:resumed',
+      'review:throttled', 'review:cleared', 'review:rehydrated',
     ];
     for (const type of types) {
       es.addEventListener(type, (e) => {

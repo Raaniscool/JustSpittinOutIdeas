@@ -62,6 +62,7 @@ app.get(['/events', '/api/events'], (req, res) => {
     knowledge: ctx.bank.stats(),
     jobs: ctx.jobs.list(),
     activeJob: ctx.jobs.active(),
+    reviews: ctx.reviews?.snapshot({ limit: 0 }) || null,
     settings: ctx.settingsStore.data,
     evalCache: ctx.engine.evalCache.stats(),
   });

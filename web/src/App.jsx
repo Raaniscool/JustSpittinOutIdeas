@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, connectEvents } from './api.js';
 import { useIdeaStore, useDebounced } from './lib/ideaStore.js';
 import TopBar from './components/TopBar.jsx';
+import PipelineStrip from './components/PipelineStrip.jsx';
 import FilterPanel from './components/FilterPanel.jsx';
 import IdeaWall from './components/IdeaWall.jsx';
 import IdeaDetail from './components/IdeaDetail.jsx';
@@ -68,6 +69,7 @@ export default function App() {
   const [knowledge, setKnowledge] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [activeJob, setActiveJob] = useState(null);
+  const [reviews, setReviews] = useState(null);
   const [panel, setPanel] = useState('lab');
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [selectedId, setSelectedId] = useState(null);
@@ -119,12 +121,13 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [s, p, m, st, b] = await Promise.all([
+        const [s, p, m, st, b, rv] = await Promise.all([
           api.settings(),
           api.providers(),
           api.models().catch(() => ({ models: [], active: null })),
           api.stats().catch(() => null),
           api.bias().catch(() => null),
+          api.reviews().catch(() => null),
         ]);
         setSettings(s.settings);
         setProviders(p.providers);
@@ -134,6 +137,7 @@ export default function App() {
           setCalibration(st.calibration);
         }
         setBias(b);
+        if (rv) setReviews(rv);
         await loadIdeas();
         api.health().then(setHealth).catch(() => {});
         api.knowledge().then(setKnowledge).catch(() => {});
@@ -160,7 +164,33 @@ export default function App() {
         setRunningAction(null);
         if (p.card?.id === selectedRef.current) refreshDetail(p.card.id);
       },
+      'review:queued': (p) => setReviews((prev) => ({ ...(prev || {}), ...p })),
+      'review:start': (p) => setReviews((prev) => ({ ...(prev || {}), ...p })),
+      'review:done': (p) => {
+        setReviews((prev) => ({ ...(prev || {}), depth: p?.depth ?? prev?.depth, active: p?.active ?? prev?.active }));
+        if (p && !p.ok && !p.aborted && p.error) say(`Review failed: ${p.error}`, true);
+      },
+      'review:paused': (p) => setReviews((prev) => ({ ...(prev || {}), ...p, paused: true })),
+      'review:resumed': (p) =>
+        setReviews((prev) => {
+          const next = { ...(prev || {}), ...p, paused: false };
+          if (next.maxDepth) next.throttled = (next.depth ?? 0) >= next.maxDepth;
+          return next;
+        }),
+      'review:throttled': (p) => {
+        setReviews((prev) => ({ ...(prev || {}), ...p, throttled: true }));
+        say('Generation throttled: the review backlog hit its cap', true);
+      },
+      'review:cleared': (p) => {
+        setReviews((prev) => ({ ...(prev || {}), depth: 0, throttled: false }));
+        if (p?.dropped) say(`Dropped ${p.dropped} ideas from the review queue (they stay on the wall, unscored)`);
+      },
+      'review:rehydrated': (p) => {
+        if (p?.count) say(`Re-queued ${p.count} unreviewed ideas from the previous session`);
+        api.reviews().then(setReviews).catch(() => {});
+      },
       snapshot: (p) => {
+        if (p.reviews) setReviews(p.reviews);
         setStats(p.stats);
         setCalibration(p.calibration);
         setSettings(p.settings);
@@ -262,6 +292,20 @@ export default function App() {
       }
     },
     [settings, say],
+  );
+
+  const reviewControl = useCallback(
+    async (fn, okMessage) => {
+      try {
+        const out = await fn();
+        if (out?.reviews) setReviews(out.reviews);
+        else api.reviews().then(setReviews).catch(() => {});
+        if (okMessage) say(okMessage);
+      } catch (err) {
+        say(err.message, true);
+      }
+    },
+    [say],
   );
 
   const jobControl = useCallback(
@@ -453,6 +497,16 @@ export default function App() {
         busy={false}
       />
 
+      <PipelineStrip
+        stats={stats}
+        reviews={reviews}
+        generating={!!activeJob && ['running', 'queued', 'paused'].includes(activeJob.status)}
+        onPauseReviews={() => reviewControl(api.pauseReviews, 'Review paused - generation keeps going, ideas stay unscored')}
+        onResumeReviews={() => reviewControl(api.resumeReviews, 'Review resumed')}
+        onClearReviews={() => reviewControl(api.clearReviews)}
+        onRequeueReviews={() => reviewControl(api.requeueReviews, 'Re-queued every unscored idea')}
+      />
+
       <div className="main">
         {panel === 'lab' && (
           <FilterPanel
@@ -606,6 +660,7 @@ export default function App() {
           {panel === 'stats' && (
             <StatsPanel
               stats={stats}
+              reviews={statsFull?.reviews || reviews}
               calibration={statsFull?.calibration || calibration}
               distribution={statsFull?.distribution || distribution}
               evalCache={statsFull?.evalCache}

@@ -202,6 +202,10 @@ export const stats = {
   ideasEvaluated: 126,
   failures: 2,
   ideasPerMinute: 12.6,
+  generatedPerMinute: 31.4,
+  reviewedPerMinute: 12.6,
+  avgReviewWaitMs: 4200,
+  maxReviewWaitMs: 18400,
   usefulPerMinute: 1.9,
   excellentPerMinute: 0.2,
   avgGenerationMs: 4210,
@@ -335,3 +339,24 @@ export const providers = [
 ];
 
 export const evalCache = { size: 84, hits: 6, misses: 120, max: 8000 };
+
+/** The review queue: evaluation running behind generation, as its own stage. */
+export const reviews = {
+  depth: 7,
+  active: 2,
+  concurrency: 3,
+  maxDepth: 120,
+  resumeDepth: 72,
+  paused: false,
+  throttled: false,
+  stopped: false,
+  completed: 126,
+  failed: 1,
+  avgWaitMs: 4200,
+  lastWaitMs: 3100,
+  next: [{ ideaId: 'idea-demo-9', title: 'Waiting for review', mode: 'fast', jobId: 'job-1', waitedMs: 1200 }],
+  running: [{ ideaId: 'idea-demo-8', title: 'Being reviewed', mode: 'fast', jobId: 'job-1', ms: 900 }],
+};
+
+export const reviewsThrottled = { ...reviews, depth: 120, active: 3, throttled: true, avgWaitMs: 41000 };
+export const reviewsPaused = { ...reviews, paused: true, active: 0 };

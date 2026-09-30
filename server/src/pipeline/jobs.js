@@ -1,21 +1,54 @@
 /**
- * Job queue.
+ * Job queue - generation only.
  *
  * Generation jobs run one at a time (a single local model is the bottleneck, so
- * queueing beats thrashing), while evaluations inside a job run concurrently.
- * Supports: generate N, continuous generation, pause, resume, stop.
+ * queueing beats thrashing). Evaluation is NOT part of this queue: a job hands
+ * its ideas to the ReviewQueue and immediately starts the next batch.
+ *
+ * Lifecycle: queued -> running (generating) -> reviewing (generation finished,
+ * this job's backlog is still being scored) -> done. Stopping a job stops
+ * generation; ideas already produced keep their place in the review queue,
+ * because discarding the score of an idea that already exists is waste.
  */
 import { emit } from '../lib/bus.js';
 import { newId } from './ideas.js';
 import { sleep, clamp } from '../lib/util.js';
 
 export class JobManager {
-  constructor({ engine, stats }) {
+  constructor({ engine, stats, reviews = null }) {
     this.engine = engine;
     this.stats = stats;
+    this.reviews = reviews;
     this.jobs = new Map();
     this.queue = [];
     this.current = null;
+  }
+
+  /**
+   * Called by the ReviewQueue the moment an idea is admitted. Counting here
+   * rather than when a batch returns means a batch aborted mid-stream still
+   * reports the ideas it actually produced - they exist and will be reviewed.
+   */
+  noteQueued(task) {
+    const job = task?.jobId ? this.jobs.get(task.jobId) : null;
+    if (!job || job.kind !== 'generate') return;
+    job.generated++;
+    emit('job:update', this.public(job));
+  }
+
+  /** Called by the ReviewQueue as each idea finishes scoring. */
+  noteReview(task) {
+    const job = task?.jobId ? this.jobs.get(task.jobId) : null;
+    if (!job) return;
+    if (task.ok) job.scored++;
+    else job.reviewFailed++;
+    emit('job:update', this.public(job));
+    if (job.status === 'reviewing' && !this.reviews?.pendingFor(job.id)) {
+      job.status = job.stopping ? 'stopped' : 'done';
+      job.finishedAt = Date.now();
+      emit('job:update', this.public(job));
+      emit('stats', this.stats.summary());
+    }
   }
 
   create(opts = {}) {
@@ -31,6 +64,7 @@ export class JobManager {
       count: requested,
       generated: 0,
       scored: 0,
+      reviewFailed: 0,
       skipped: 0,
       failed: 0,
       batches: 0,
@@ -63,6 +97,8 @@ export class JobManager {
       continuous: job.continuous,
       generated: job.generated,
       scored: job.scored,
+      reviewFailed: job.reviewFailed,
+      pendingReview: this.reviews?.pendingFor(job.id) || 0,
       skipped: job.skipped,
       failed: job.failed,
       batches: job.batches,
@@ -92,7 +128,7 @@ export class JobManager {
     try {
       if (job.kind === 'action') await this.#runAction(job);
       else await this.#runGenerate(job);
-      if (job.status === 'running') job.status = job.stopping ? 'stopped' : 'done';
+      if (job.status === 'running' || job.status === 'reviewing') job.status = job.stopping ? 'stopped' : 'done';
     } catch (err) {
       job.status = err?.message === 'aborted' ? 'stopped' : 'error';
       job.error = err?.message || String(err);
@@ -137,8 +173,8 @@ export class JobManager {
           signal: job.controller.signal,
           shouldContinue: () => !job.stopping && !job.paused,
         });
-        job.generated += r.generated;
-        job.scored += r.scored;
+        // job.generated is tallied by noteQueued as ideas are admitted, so a
+        // batch aborted halfway still counts what it produced.
         job.skipped += r.skipped;
         job.batches++;
         job.model = r.model;
@@ -146,7 +182,6 @@ export class JobManager {
           at: Date.now(),
           requested: size,
           generated: r.generated,
-          scored: r.scored,
           skipped: r.skipped,
           ms: Math.round(Date.now() - started),
           model: r.model,
@@ -162,6 +197,14 @@ export class JobManager {
       }
       emit('job:update', this.public(job));
       emit('stats', this.stats.summary());
+    }
+
+    // Generation is over. The ideas are already on the wall and the review
+    // workers are scoring them; wait only so the job reports an honest end state.
+    if (!job.stopping && this.reviews?.pendingFor(job.id)) {
+      job.status = 'reviewing';
+      emit('job:update', this.public(job));
+      await this.reviews.settledFor(job.id);
     }
   }
 

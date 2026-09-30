@@ -130,6 +130,7 @@ export class IdeaEngine {
     // concurrent requests against a local model that serialises anyway.
     this.deepLimiter = createLimiter(this.deepConcurrency());
     this.limiterDeepConcurrency = this.deepConcurrency();
+    this.reviews = null; // wired in app.js: evaluation runs on its own queue
     this._loadedModel = null;
     this._modelCache = { at: 0, model: null };
     this.inFlight = 0;
@@ -308,9 +309,14 @@ export class IdeaEngine {
       mode,
     });
 
-    const pending = [];
+    // Backpressure: if review has fallen maxDepth behind, wait for the backlog to
+    // drain to the low-water mark before spending more tokens on ideas nobody has
+    // scored yet. Under normal load this resolves immediately.
+    if (!(await this.reviews.waitForCapacity(signal))) throw new ProviderError('aborted', { code: 'aborted' });
+
     let streamed = 0;
     let skipped = 0;
+    let queued = 0;
 
     const res = await this.callModel({
       role: 'generator',
@@ -328,7 +334,9 @@ export class IdeaEngine {
           skipped++;
           return;
         }
-        pending.push(this.ingest(idea, { jobId, model, providerId: provider.id, mode, signal }));
+        // Fire and forget: the idea is on the wall and in the review queue.
+        this.admit(idea, { jobId, model, providerId: provider.id, mode });
+        queued++;
       },
     });
 
@@ -342,7 +350,8 @@ export class IdeaEngine {
           continue;
         }
         streamed++;
-        pending.push(this.ingest(idea, { jobId, model, providerId: provider.id, mode, signal }));
+        this.admit(idea, { jobId, model, providerId: provider.id, mode });
+        queued++;
       }
     }
 
@@ -350,8 +359,8 @@ export class IdeaEngine {
     this.bank.recordUsage(touched);
     if (touched.length) emit('knowledge:usage', { count: touched.length });
 
-    const results = await Promise.all(pending);
-    const scored = results.filter((r) => r && r.ok).length;
+    // No awaiting reviews here. That is the entire point of the split: the next
+    // batch starts as soon as this one has been generated.
 
     // Cheap, throttled housekeeping: bias check without blocking generation.
     void this.bias.maybeAnalyze({ signal }).then((report) => {
@@ -361,7 +370,8 @@ export class IdeaEngine {
     return {
       requested: count,
       generated: streamed,
-      scored,
+      queued,
+      scored: 0, // reviews are asynchronous now; the job queue tallies these
       skipped,
       ms: performance.now() - started,
       model,
@@ -372,10 +382,13 @@ export class IdeaEngine {
   }
 
   /**
-   * Take one normalized idea: persist it immediately (so it appears on the wall
-   * at once), then score it through the concurrency limiter.
+   * Take one normalized idea and hand it to the review queue.
+   *
+   * This is deliberately NOT async work: the idea is persisted (so it lands on
+   * the wall immediately, marked as awaiting review) and queued, then we return.
+   * Scoring happens later on the review workers. The generator never waits here.
    */
-  async ingest(idea, { jobId = null, model = '', providerId = '', mode = 'fast', signal, origin = 'generated', parentId = null } = {}) {
+  admit(idea, { jobId = null, model = '', providerId = '', mode = 'fast', origin = 'generated', parentId = null } = {}) {
     const record = {
       id: newId(),
       ...idea,
@@ -406,29 +419,31 @@ export class IdeaEngine {
     this.repo.add(record);
     emit('idea:new', { card: IdeaRepository.card(record), jobId });
 
-    try {
-      await this.evalLimiter(() => this.score(record, { model, signal, mode }));
-      // Deep work runs *after* the limiter slot is released. Attack/improve spawn
-      // child ideas that need an evaluation slot of their own, so nesting the
-      // deep pass inside the parent's slot deadlocks the pool the moment as many
-      // ideas are in flight as `evaluateConcurrency` allows.
-      //
-      // Derived ideas are never deep either: one level of improve/mutate is the
-      // useful amount, and letting a child inherit `deep` recursed without bound
-      // (improve -> child -> improve -> grandchild -> ...).
-      if (mode === 'deep' && origin === 'generated') {
-        const scored = this.repo.get(record.id) || record;
-        if (scored.scoringState !== 'failed') await this.deepLimiter(() => this.deepPass(scored, { signal }));
-      }
-      return { ok: true, id: record.id, overall: record.score?.overall };
-    } catch (err) {
-      record.scoringState = 'failed';
-      record.error = err.message;
-      this.repo.update(record.id, { scoringState: 'failed', error: err.message });
-      this.stats.recordEvaluation({ failed: true, model, ms: 0 });
-      emit('idea:updated', { card: IdeaRepository.card(record), error: err.message, jobId });
-      return { ok: false, id: record.id, error: err.message };
+    this.reviews.enqueue(record, { mode, model, jobId });
+    return { ok: true, id: record.id, queued: true, overall: null };
+  }
+
+  /**
+   * Admit an idea and wait for its review to finish. Only for callers that
+   * genuinely need the score in hand (tests, one-off scripted work) - the
+   * generation path must never use this.
+   */
+  async admitAndWait(idea, opts = {}) {
+    const { id } = this.admit(idea, opts);
+    const task = this.reviews.queue.find((t) => t.ideaId === id) || [...this.reviews.inFlight].find((t) => t.ideaId === id);
+    if (task) {
+      await new Promise((resolve) => {
+        const check = () => {
+          if (task.finishedAt) return resolve();
+          setTimeout(check, 20);
+        };
+        check();
+      });
+    } else {
+      await this.reviews.drain();
     }
+    const record = this.repo.get(id);
+    return { ok: record?.scoringState === 'scored', id, overall: record?.score?.overall ?? null, error: record?.error };
   }
 
   /**
@@ -597,11 +612,10 @@ export class IdeaEngine {
             businessModel: improved.businessModel || idea.businessModel,
             distribution: idea.distribution,
           });
-          const created = await this.ingest(child, {
+          const created = this.admit(child, {
             model,
             providerId: idea.provider,
-            mode: 'fast', // derived ideas are scored, never deep-passed (see ingest)
-            signal,
+            mode: 'fast', // derived ideas are scored, never deep-passed (see ReviewQueue)
             origin: 'improved',
             parentId: idea.id,
           });
@@ -625,11 +639,10 @@ export class IdeaEngine {
         for (const v of variants) {
           const child = normalizeIdea(v);
           if (!isViableIdea(child)) continue;
-          const created = await this.ingest(child, {
+          const created = this.admit(child, {
             model,
             providerId: idea.provider,
-            mode: 'fast', // derived ideas are scored, never deep-passed (see ingest)
-            signal,
+            mode: 'fast', // derived ideas are scored, never deep-passed (see ReviewQueue)
             origin: 'mutated',
             parentId: idea.id,
           });

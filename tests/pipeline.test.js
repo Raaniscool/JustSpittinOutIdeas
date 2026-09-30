@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -24,6 +24,12 @@ patchSettings(ctx, {
   pipeline: { biasCheckEvery: 12, recombination: true },
 });
 
+// Review is asynchronous now, so a test that generates ideas would otherwise leak
+// in-flight evaluations into the next test (and its model-call counting).
+afterEach(async () => {
+  await ctx.engine.reviews.drain();
+});
+
 test('idea normalisation and the garbage filter', () => {
   assert.equal(normalizeCategory('Dev Tools'), 'developer-tools');
   assert.equal(normalizeCategory('Machine Learning'), 'ai');
@@ -42,9 +48,15 @@ test('a batch is generated, streamed and every idea is scored', async () => {
   const before = ctx.repo.count();
   const res = await ctx.engine.generateBatch({ count: 8, category: 'any', mode: 'fast' });
   assert.equal(res.generated, 8);
-  assert.equal(res.scored, 8);
-  assert.equal(ctx.repo.count(), before + 8);
+  assert.equal(res.queued, 8, 'every idea is handed to the review queue');
+  assert.equal(res.scored, 0, 'generation does not wait for review any more');
+  assert.equal(ctx.repo.count(), before + 8, 'ideas are on the wall immediately');
+  assert.ok(
+    ctx.repo.all().slice(-8).some((i) => i.scoringState === 'queued' || i.scoringState === 'scoring'),
+    'at least some are still awaiting review when generation returns',
+  );
 
+  await ctx.engine.reviews.drain();
   for (const idea of ctx.repo.all().slice(-8)) {
     assert.equal(idea.scoringState, 'scored', `${idea.title} should be scored`);
     assert.ok(idea.evaluation?.factors, 'factors present');
@@ -93,8 +105,8 @@ test('identical ideas reuse the cached evaluation instead of burning a model cal
     targetUser: 'Municipal permit clerks',
     businessModel: 'Subscription',
   });
-  const first = await ctx.engine.ingest(idea, { model: 'idealab-sim-1b', providerId: 'demo' });
-  const second = await ctx.engine.ingest({ ...idea }, { model: 'idealab-sim-1b', providerId: 'demo' });
+  const first = await ctx.engine.admitAndWait(idea, { model: 'idealab-sim-1b', providerId: 'demo' });
+  const second = await ctx.engine.admitAndWait({ ...idea }, { model: 'idealab-sim-1b', providerId: 'demo' });
   assert.ok(first.ok && second.ok);
   const after = ctx.stats.calls.cacheHits + ctx.stats.calls.duplicateSkips;
   assert.ok(after > hitsBefore, 'the second identical idea must not cost another evaluation call');
@@ -112,7 +124,7 @@ test('near-duplicates are marked, never deleted', async () => {
     targetUser: 'Veterinary clinic administrators',
   });
   const before = ctx.repo.count();
-  const out = await ctx.engine.ingest(variant, { model: 'idealab-sim-1b', providerId: 'demo' });
+  const out = await ctx.engine.admitAndWait(variant, { model: 'idealab-sim-1b', providerId: 'demo' });
   assert.ok(out.ok);
   assert.equal(ctx.repo.count(), before + 1, 'variants are kept');
   const saved = ctx.repo.get(out.id);
@@ -138,7 +150,12 @@ test('improve creates a new scored child idea', async () => {
   const before = ctx.repo.count();
   const out = await ctx.engine.runAction(target.id, 'improve', {});
   assert.ok(out.childId, 'the improved idea becomes its own record');
-  assert.equal(ctx.repo.count(), before + 1);
+  assert.equal(ctx.repo.count(), before + 1, 'the child exists immediately, before it is reviewed');
+  assert.ok(
+    ['queued', 'scoring'].includes(ctx.repo.get(out.childId).scoringState),
+    'and starts life in the review queue rather than already scored',
+  );
+  await ctx.engine.reviews.drain();
   const child = ctx.repo.get(out.childId);
   assert.equal(child.origin, 'improved');
   assert.equal(child.parentId, target.id);
@@ -180,7 +197,8 @@ test('a deep batch completes when more ideas are in flight than the eval pool al
       'deep batch',
     );
     assert.equal(res.generated, 6);
-    assert.equal(res.scored, 6);
+    assert.equal(res.queued, 6);
+    await ctx.engine.reviews.drain();
 
     const added = ctx.repo.all().slice(before);
     assert.ok(added.length >= 6, 'the batch is in the bank');
@@ -225,6 +243,7 @@ test('a job can pin an explicit model instead of the global default', async () =
   );
   assert.equal(res.model, 'idealab-sim-8b', 'the batch reports the model that actually ran');
   assert.equal(res.generated, 6);
+  await ctx.engine.reviews.drain();
 
   const added = ctx.repo.all().slice(before);
   assert.equal(added.length, 6);
@@ -242,6 +261,7 @@ test('a job can pin an explicit model instead of the global default', async () =
   const target = added[0];
   const out = await ctx.engine.runAction(target.id, 'improve', { model: 'idealab-sim-4b' });
   assert.ok(out.childId, 'improve produced a child');
+  await ctx.engine.reviews.drain();
   const child = ctx.repo.get(out.childId);
   assert.equal(child.model, 'idealab-sim-4b', 'the child is scored by the model that was asked for');
   assert.equal(child.evaluation?.model, 'idealab-sim-4b');
@@ -308,7 +328,7 @@ test('knowledge extraction is gated but does add real components', async () => {
 test('the bias monitor raises directives once a concentration exists', async () => {
   // force a lopsided bank
   for (let i = 0; i < 14; i++) {
-    await ctx.engine.ingest(
+    await ctx.engine.admitAndWait(
       normalizeIdea({
         title: `AI writing assistant variant ${i}`,
         description: `Another LLM wrapper that drafts marketing copy for small agencies, number ${i} in the series.`,

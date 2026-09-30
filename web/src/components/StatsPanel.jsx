@@ -13,7 +13,7 @@ function Big({ label, value, sub, color }) {
   );
 }
 
-export default function StatsPanel({ stats, calibration, distribution, evalCache, model, provider, onReset }) {
+export default function StatsPanel({ stats, calibration, distribution, evalCache, model, provider, reviews, onReset }) {
   const s = stats || {};
   const c = calibration || {};
   const healthColor =
@@ -37,8 +37,14 @@ export default function StatsPanel({ stats, calibration, distribution, evalCache
       </div>
 
       <div className="grid-3">
-        <Big label="Ideas generated" value={s.ideasGenerated ?? 0} sub={`${s.ideasEvaluated ?? 0} evaluated · ${s.failures ?? 0} failures`} />
-        <Big label="Ideas / minute" value={s.ideasPerMinute ?? 0} sub="whole pipeline throughput" color="var(--accent)" />
+        <Big label="Ideas generated" value={s.ideasGenerated ?? 0} sub={`${s.ideasEvaluated ?? 0} reviewed · ${s.failures ?? 0} failures`} />
+        <Big label="Generated / minute" value={s.generatedPerMinute ?? s.ideasPerMinute ?? 0} sub="what the model is producing right now" color="var(--accent)" />
+        <Big
+          label="Reviewed / minute"
+          value={s.reviewedPerMinute ?? s.ideasPerMinute ?? 0}
+          sub={`review queue: ${reviews?.depth ?? 0} waiting · ${reviews?.active ?? 0} in flight · avg wait ${ms(reviews?.avgWaitMs ?? s.avgReviewWaitMs ?? 0)}`}
+          color={(reviews?.throttled || (reviews?.avgWaitMs ?? 0) > 30000) ? 'var(--warn)' : undefined}
+        />
         <Big
           label="Useful ideas / minute"
           value={s.usefulPerMinute ?? 0}

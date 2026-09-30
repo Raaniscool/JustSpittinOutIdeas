@@ -12,6 +12,7 @@ import { CalibrationMonitor } from './pipeline/calibration.js';
 import { BiasMonitor } from './pipeline/bias.js';
 import { IdeaEngine } from './pipeline/engine.js';
 import { JobManager } from './pipeline/jobs.js';
+import { ReviewQueue } from './pipeline/review.js';
 import { normalizeWeights, DEFAULT_CALIBRATION } from './pipeline/scoring.js';
 import { clamp } from './lib/util.js';
 
@@ -57,8 +58,18 @@ export function createApp() {
   });
   engine.bias = bias;
 
-  const jobs = new JobManager({ engine, stats });
+  // Review is its own queue: the generator hands ideas over and keeps going.
+  const reviews = new ReviewQueue({ engine, stats, getSettings: () => settingsStore.data });
+  engine.reviews = reviews;
+
+  const jobs = new JobManager({ engine, stats, reviews });
+  reviews.onDone = (task) => jobs.noteReview(task);
+  reviews.onEnqueue = (task) => jobs.noteQueued(task);
   configureProviders(settingsStore.data, { bank });
+
+  // Anything a previous run left unreviewed (crash, stop, shutdown mid-review)
+  // goes straight back into the queue instead of sitting unscored forever.
+  reviews.rehydrate(repo.all());
 
   const ctx = {
     settingsStore,
@@ -73,6 +84,7 @@ export function createApp() {
     bias,
     engine,
     jobs,
+    reviews,
     startedAt: Date.now(),
   };
   return ctx;
@@ -86,6 +98,7 @@ export function patchSettings(ctx, patch = {}) {
   const p = next.performance || {};
   p.ideasPerGenerationCall = clamp(Math.round(p.ideasPerGenerationCall || 6), 1, 25);
   p.evaluateConcurrency = clamp(Math.round(p.evaluateConcurrency || 3), 1, 16);
+  p.maxReviewDepth = clamp(Math.round(p.maxReviewDepth ?? 120), 4, 100000);
   p.generateConcurrency = clamp(Math.round(p.generateConcurrency || 1), 1, 8);
   p.numCtxGenerate = clamp(Math.round(p.numCtxGenerate || 3072), 512, 131072);
   p.numCtxEvaluate = clamp(Math.round(p.numCtxEvaluate || 2048), 512, 131072);
@@ -118,6 +131,7 @@ export function patchSettings(ctx, patch = {}) {
   configureProviders(next, { bank: ctx.bank });
   ctx.calibration.configure(next.scoring.calibration);
   ctx.engine.syncConcurrency();
+  ctx.reviews?.syncConcurrency();
   ctx.engine.evalCache.ttlMs = next.performance.evalCacheTtlMs;
   ctx.engine._modelCache = { at: 0, model: null };
   return next;
@@ -125,5 +139,10 @@ export function patchSettings(ctx, patch = {}) {
 
 export async function shutdown(ctx) {
   ctx.jobs.stopAll();
+  // Abort in-flight reviews and let them settle, so the ideas they were holding
+  // are persisted as 'queued' and get re-reviewed on the next boot.
+  ctx.reviews?.stop();
+  const t0 = Date.now();
+  while (ctx.reviews?.inFlight.size && Date.now() - t0 < 1500) await new Promise((r) => setTimeout(r, 40));
   await flushAll(ctx.stores);
 }

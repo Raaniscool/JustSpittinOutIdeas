@@ -33,7 +33,11 @@ export const DEFAULT_SETTINGS = {
   // ---- throughput knobs --------------------------------------------------
   performance: {
     ideasPerGenerationCall: envInt(process.env.IDEALAB_BATCH, 6), // batch generation
+    // Review (evaluation) workers. This is the queue that scores ideas after the
+    // generator has moved on - it no longer gates generation.
     evaluateConcurrency: envInt(process.env.IDEALAB_EVAL_CONCURRENCY, 3),
+    // How far review may fall behind generation before the generator waits.
+    maxReviewDepth: envInt(process.env.IDEALAB_REVIEW_DEPTH, 120),
     // deep mode only: attack + improve (+ children) per idea, bounded separately
     deepConcurrency: envInt(process.env.IDEALAB_DEEP_CONCURRENCY, 2),
     generateConcurrency: envInt(process.env.IDEALAB_GEN_CONCURRENCY, 1),

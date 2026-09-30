@@ -95,8 +95,10 @@ export default function SettingsPanel({ settings, onPatch, onReset, health, onPr
           <h5>Throughput</h5>
           <Num label="Ideas per generation call" value={perf.ideasPerGenerationCall} onChange={(v) => setPerf({ ideasPerGenerationCall: v })} min={1} max={25}
             hint="Batching amortises prompt processing. Too high and small models lose coherence." />
-          <Num label="Concurrent evaluations" value={perf.evaluateConcurrency} onChange={(v) => setPerf({ evaluateConcurrency: v })} min={1} max={16}
-            hint="Match OLLAMA_NUM_PARALLEL. Higher = more ideas scored per minute, until the GPU saturates." />
+          <Num label="Concurrent review workers" value={perf.evaluateConcurrency} onChange={(v) => setPerf({ evaluateConcurrency: v })} min={1} max={16}
+            hint="Evaluations run on their own queue, so this no longer gates generation. Match OLLAMA_NUM_PARALLEL; higher scores more ideas per minute until the GPU saturates." />
+          <Num label="Max review backlog" value={perf.maxReviewDepth ?? 120} onChange={(v) => setPerf({ maxReviewDepth: v })} min={4} max={5000}
+            hint="How far review may fall behind generation. At the cap the generator waits for the backlog to drain to 60%, so memory and staleness stay bounded." />
           <Num label="Concurrent deep actions" value={perf.deepConcurrency ?? 2} onChange={(v) => setPerf({ deepConcurrency: v })} min={1} max={8}
             hint="Deep mode only: attack + improve per idea, bounded separately from the evaluation pool." />
           <Num label="num_ctx (generate)" value={perf.numCtxGenerate} onChange={(v) => setPerf({ numCtxGenerate: v })} min={512} max={65536} step={256} />

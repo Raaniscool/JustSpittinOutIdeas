@@ -45,6 +45,52 @@ Requirements: Node ≥ 20.11 (uses the built-in test runner and `fetch`). Ollama
 
 ---
 
+## Two queues: generation never waits for review
+
+Generation and evaluation are **separate job streams** that meet only through a queue.
+
+```
+generator ──▶ wall of cards (unscored, visible immediately) ──▶ review queue ──▶ N workers ──▶ scored card
+   │                                                                │
+   └── starts the next batch immediately                            └── bounded; throttles the generator at the cap
+```
+
+An idea is parsed out of the token stream, persisted, put on the wall, and handed to the review queue in the same
+tick. The generator then starts the next batch. It never blocks on an evaluation, so the model is never sitting
+idle while a judgment is written. Reviews outlive the job that produced them: stopping generation does not throw
+away the scores for ideas that already exist, and anything still unreviewed at shutdown is re-queued on the next
+boot rather than being silently left unscored.
+
+The backlog is bounded. If review falls `IDEALAB_REVIEW_DEPTH` ideas behind (default 120), the generator waits for
+the queue to drain to 60% of the cap instead of growing it without limit — memory stays flat and scores stay
+recent. The strip under the header shows all three stages live: generation rate, backlog and average wait, review
+rate.
+
+### Measured
+
+`scripts/bench-pipeline.mjs` runs the same workload through both pipelines against a stub backend that is pure
+latency behind *P* parallel slots — *P* is `OLLAMA_NUM_PARALLEL`, so this models a real local GPU rather than the
+demo simulator. 36 ideas, one 2.5 s generation call per 6 ideas, one 1.8 s evaluation per idea, 3 review workers,
+42 model calls and 0 skipped in every row:
+
+| P | pipeline | generation done | everything reviewed | ideas/min | avg review wait |
+| --- | --- | --- | --- | --- | --- |
+| 1 | blocked (old) | 79.8s | 79.8s | 27.1 | 1.8s |
+| 1 | **decoupled** | **42.0s** | 79.8s | **51.4** | 16.6s |
+| 4 | blocked (old) | 36.6s | 36.6s | 58.9 | 0.9s |
+| 4 | **decoupled** | **15.0s** | **24.1s** | **143.8** | **3.6s** |
+
+Read that honestly. Total model work is conserved — a single serial slot spends the same 79.8 s either way, so
+decoupling cannot create throughput that the hardware does not have. What it does is stop the generator idling
+inside that budget: at P=1 you get ideas at 51/min instead of 27/min, and at P=4 generation is 59% faster and
+end-to-end 34% faster with review landing ~3.6 s behind generation.
+
+The consequence worth knowing: **review is the bottleneck, not generation.** One 1.8 s evaluation per idea caps
+review at ~33 ideas/min no matter how fast ideas arrive. To keep the review lag inside a few seconds either give
+the model parallel slots (`OLLAMA_NUM_PARALLEL=4`, needs VRAM) and matching review workers, or make each
+evaluation cheaper — shorter `num_ctx`, lower `num_predict`, a smaller evaluator model. The backlog and average
+wait in the strip tell you which side is losing.
+
 ## Why it is fast
 
 Speed is a feature here, because the product is *volume*. The metric that matters is **useful ideas per
@@ -52,10 +98,11 @@ minute**, not tokens per second.
 
 | Technique | What it does |
 | --- | --- |
-| **Pipelined generation + evaluation** | Ideas are parsed out of the token stream one at a time. Idea #1 is being evaluated while the model is still generating idea #6. (`lib/jsonStream.js`, `providers/ollama.js`) |
+| **Decoupled generation and review** | Two queues, so the generator never waits on an evaluator (above). |
+| **Incremental stream parsing** | Ideas are parsed out of the token stream one at a time and land on the wall before the call finishes. (`lib/jsonStream.js`, `providers/ollama.js`) |
 | **Batched generation** | One model call returns N ideas as a JSON array instead of N calls. |
 | **Structured output** | `format` = JSON schema. The model cannot spend tokens on prose and we never pay for a parse-retry loop. Falls back to `format:"json"` on older Ollama builds automatically. |
-| **Concurrent evaluation** | Independent ideas are evaluated through a concurrency limiter (default 3 — match `OLLAMA_NUM_PARALLEL`). |
+| **Concurrent review workers** | Independent ideas are evaluated by a worker pool (default 3 — match `OLLAMA_NUM_PARALLEL`), separately bounded from deep actions. |
 | **Stable system prompt** | Role prompts are byte-identical across calls so Ollama reuses its cached prompt prefix; everything variable goes in the user message. |
 | **Persistent keep-alive sockets** | A hand-rolled `node:http` agent pool keeps one connection warm for hundreds of requests (`lib/http.js`). |
 | **Resident weights** | `keep_alive` on every request + an explicit preload when the model changes, so the load cost is paid once. |
@@ -235,7 +282,8 @@ initial values:
 | `IDEALAB_PROVIDER` | `ollama` | `ollama` or `demo` |
 | `IDEALAB_MODEL` | *(auto)* | Model id; empty = smallest installed |
 | `IDEALAB_BATCH` | `6` | Ideas per generation call |
-| `IDEALAB_EVAL_CONCURRENCY` | `3` | Concurrent evaluations (match `OLLAMA_NUM_PARALLEL`) |
+| `IDEALAB_EVAL_CONCURRENCY` | `3` | Concurrent review workers (match `OLLAMA_NUM_PARALLEL`) |
+| `IDEALAB_REVIEW_DEPTH` | `120` | Review backlog at which generation throttles until it drains to 60% |
 | `IDEALAB_DEEP_CONCURRENCY` | `2` | Concurrent deep actions (attack/improve), capped at the eval concurrency |
 | `IDEALAB_CTX_GEN` / `_CTX_EVAL` / `_CTX_DEEP` | `3072 / 2048 / 3072` | `num_ctx` per role |
 | `IDEALAB_MAXTOK_GEN` / `_EVAL` / `_DEEP` | `1400 / 900 / 1200` | `num_predict` caps |
@@ -260,8 +308,12 @@ GET    /api/models[?refresh=1]         models the provider actually has installe
 POST   /api/models/preload|unload      keep weights resident / free RAM
 GET    /api/settings   PATCH /api/settings   POST /api/settings/reset
 GET    /api/scoring                  factors, weights, calibration state, 40-step colour ramp
-POST   /api/jobs                     { count | continuous, category, mode } or { action, ideaId }
+POST   /api/jobs                     { count | continuous, category, mode, model } or { action, ideaId }
 GET    /api/jobs     POST /api/jobs/:id/pause|resume|stop    POST /api/jobs/stop-all
+GET    /api/reviews                  review queue: depth, workers in flight, backlog cap, avg wait, next up
+POST   /api/reviews/pause|resume     stop or restart scoring without touching generation
+POST   /api/reviews/clear            drop the backlog (ideas stay on the wall, unscored)
+POST   /api/reviews/requeue          re-queue every idea that is still unscored
 GET    /api/ideas?sort=&min_novelty=8&category=&q=&limit=    filter + sort the wall
 GET    /api/ideas/:id                full record, similar ideas, children, parent
 PATCH  /api/ideas/:id                status, starred, notes, tags    DELETE /api/ideas/:id
@@ -270,8 +322,9 @@ GET    /api/stats                    throughput, quality gates, per-model compar
 GET    /api/bias     POST /api/bias/analyze    POST /api/bias/reset
 GET    /api/knowledge   POST /api/knowledge    PATCH/DELETE /api/knowledge/:id
 POST   /api/knowledge/:id/promote    POST /api/knowledge/extract
-GET    /events                       single SSE stream: snapshot, idea:new, idea:scored,
-                                     idea:updated, job:update, stats, calibration, bias, knowledge
+GET    /events                       single SSE stream: snapshot, idea:new, idea:scored, idea:updated,
+                                     job:update, stats, calibration, bias, knowledge, and the review
+                                     lifecycle (review:queued|start|done|paused|resumed|throttled|cleared)
 ```
 
 ---
@@ -279,10 +332,21 @@ GET    /events                       single SSE stream: snapshot, idea:new, idea
 ## Tests
 
 ```bash
-npm test              # 85 tests
+npm test              # 97 tests
 npm run test:unit     # scoring, calibration guards, colour ramp, stream parser, similarity, knowledge gating, UI render
 npm run test:pipeline # end-to-end pipeline against the synthetic provider
 npm run test:api      # HTTP + SSE integration against a real spawned server
+```
+
+`tests/throughput.test.js` pins the decoupling itself, and each of its seven tests fails against the old
+batch-scoped pipeline: generation returns while its ideas are still unreviewed, the next batch starts before the
+previous one has been scored, a continuous job keeps producing while review trails it, the generator is throttled
+at the backlog cap and released when review catches up, every idea records how long it waited, deep review also
+runs off the generation path, and unreviewed ideas are re-queued after a restart.
+
+```bash
+node scripts/bench-pipeline.mjs 36 4     # blocked vs decoupled against a P-slot stub backend
+node scripts/bench-throughput.mjs 60 3   # the same comparison through the demo provider
 ```
 
 The suite asserts the things that matter: the overall score equals its deterministic recomputation, the
@@ -300,14 +364,15 @@ shared/scoring.js         one implementation of factors, weights, evidence guard
 server/src/
   providers/              ollama.js · demo.js · index.js (registry)
   prompts/                roles.js (9 separate role prompts) · schemas.js · build.js
-  pipeline/               engine.js · jobs.js · scoring.js · calibration.js · bias.js
-                          ideas.js · similarity.js · stats.js
+  pipeline/               engine.js · jobs.js (generation) · review.js (evaluation queue)
+                          scoring.js · calibration.js · bias.js · ideas.js · similarity.js · stats.js
   knowledge/              seed.js (~60 hand-written blocks) · bank.js (gated ingestion)
   lib/                    http.js (keep-alive pool) · jsonStream.js (incremental JSON) · store.js · bus.js · util.js
   routes/api.js           HTTP API
-web/src/                  React UI: TopBar, FilterPanel, IdeaWall, IdeaCard, IdeaDetail,
+web/src/                  React UI: TopBar, PipelineStrip, FilterPanel, IdeaWall, IdeaCard, IdeaDetail,
                           KnowledgePanel, BiasPanel, StatsPanel, SettingsPanel
 scripts/                  dev.mjs (server + vite) · bootstrap.mjs (self-healing start) · ollama-check.mjs
+                          bench-pipeline.mjs · bench-throughput.mjs
 data/                     your ideas, knowledge bank and settings (gitignored, local-only)
 ```
 
@@ -318,5 +383,11 @@ data/                     your ideas, knowledge bank and settings (gitignored, l
 * Score inflation is fought in three places (prompt anchoring, deterministic evidence guards, live
   distribution feedback) but a weak model can still be inconsistent. If the calibration chip in the header
   says `inflated`, the monitor is already pushing back — or switch models and compare.
-* Local models are slow. Continuous mode plus a small model plus a matching `OLLAMA_NUM_PARALLEL` is the
-  practical configuration for volume.
+* Local models are slow, and **review is the bottleneck, not generation**. Decoupling stops the generator
+  idling, but it cannot create model capacity: one 1.8 s evaluation per idea caps review at ~33 ideas/min
+  however fast ideas arrive. If the strip shows the backlog growing and the average wait climbing, either give
+  the model parallel slots (`OLLAMA_NUM_PARALLEL`, plus matching review workers) or make each evaluation
+  cheaper — smaller `num_ctx`, lower `num_predict`, a smaller evaluator model.
+* The backlog cap is a real limit, not a bug. At `IDEALAB_REVIEW_DEPTH` (default 120) the generator waits for
+  review to drain to 60%. That is deliberate: an unbounded queue means ideas scored minutes after they were
+  generated, against a calibration window that no longer reflects what is on screen.

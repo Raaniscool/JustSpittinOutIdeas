@@ -25,6 +25,7 @@ export class StatsCollector {
       genMs: [],
       evalMs: [],
       deepMs: [],
+      reviewWaitMs: [], // generated -> review started (the decoupling lag)
       scores: [],
       tokens: { prompt: 0, completion: 0 },
       tokensPerSec: [],
@@ -103,6 +104,18 @@ export class StatsCollector {
     m.generated++;
   }
 
+  /**
+   * How long an idea sat in the review queue before a worker picked it up.
+   * With generation decoupled this is the number that says whether review is
+   * keeping up: it should stay in the low seconds, not grow without bound.
+   */
+  recordReviewWait({ ms }) {
+    if (!Number.isFinite(ms)) return;
+    const s = this.session;
+    s.reviewWaitMs.push(ms);
+    if (s.reviewWaitMs.length > 400) s.reviewWaitMs.shift();
+  }
+
   recordDeep({ ms, action }) {
     this.session.deepMs.push(ms);
     if (this.session.deepMs.length > 300) this.session.deepMs.shift();
@@ -142,6 +155,10 @@ export class StatsCollector {
       ideasEvaluated: s.evaluated,
       failures: s.failed,
       ideasPerMinute: round1(s.evaluated / minutes),
+      generatedPerMinute: round1((s.generated + s.derived) / minutes),
+      reviewedPerMinute: round1(s.evaluated / minutes),
+      avgReviewWaitMs: avg(s.reviewWaitMs),
+      maxReviewWaitMs: s.reviewWaitMs.length ? Math.round(Math.max(...s.reviewWaitMs)) : 0,
       usefulPerMinute: round2(ge(7) / minutes),
       excellentPerMinute: round2(ge(8) / minutes),
       avgGenerationMs: avg(s.genMs),

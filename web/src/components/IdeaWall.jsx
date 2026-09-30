@@ -13,6 +13,8 @@ const PAGE = 48;
 export default function IdeaWall({ items, loading, onOpen, onStar, selectedId, density, onLoadMore, hasMore, onGenerate }) {
   const [shown, setShown] = useState(PAGE);
   const sentinel = useRef(null);
+  const shownRef = useRef(shown);
+  shownRef.current = shown;
 
   // Reset the render window when the result set changes shape (new filter/sort).
   const signature = `${items.length}:${items[0]?.id || ''}:${density}`;
@@ -27,19 +29,17 @@ export default function IdeaWall({ items, loading, onOpen, onStar, selectedId, d
     if (!el) return;
     const io = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setShown((s) => {
-            if (s >= items.length) return s;
-            onLoadMore?.();
-            return Math.min(items.length, s + PAGE);
-          });
-        }
+        if (!entries.some((e) => e.isIntersecting)) return;
+        // grow the visible window; ask for more data only when we run out
+        setShown((s) => Math.min(items.length, s + PAGE));
+        if (shownRef.current >= items.length) onLoadMore?.();
       },
       { rootMargin: '600px 0px' },
     );
     io.observe(el);
     return () => io.disconnect();
   }, [items.length, onLoadMore]);
+
 
   if (!items.length && !loading) {
     return (

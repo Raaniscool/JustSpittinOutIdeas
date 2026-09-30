@@ -14,6 +14,16 @@
  */
 import { hashString, pick, seededRandom } from '../lib/util.js';
 import { JsonItemStream } from '../lib/jsonStream.js';
+import { buildEvaluatePrompt } from '../prompts/build.js';
+
+/**
+ * Cost model for a batched evaluator call: judging K ideas in one call is not K
+ * separate calls - one round trip, one shared prefill - but it is not free
+ * either, since K judgments still have to be written out. The simulator charges
+ * 1 + 0.35*(K-1) times a single call. That is an ASSUMPTION, not a measurement:
+ * real cost depends on your model and hardware.
+ */
+const BATCH_COST_PER_EXTRA_IDEA = 0.35;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -138,6 +148,34 @@ function parseIdeaFromEvalPrompt(prompt) {
   }
 }
 
+const BATCH_MARKER = /^EVALUATE EACH OF THE FOLLOWING (\d+) IDEAS INDEPENDENTLY\.$/m;
+
+/**
+ * Read a batched evaluation prompt back into its parts. Returns null for a
+ * single-idea prompt, which is what keeps the ordinary path untouched.
+ */
+function parseBatchEvalPrompt(prompt) {
+  const text = prompt || '';
+  const marker = text.match(BATCH_MARKER);
+  if (!marker) return null;
+  // buildBatchEvaluatePrompt puts the calibration directive first, so everything
+  // before the marker is exactly the directive the single-idea path would get.
+  const directive = text.slice(0, marker.index).trimEnd();
+  const lines = text.split('\n');
+  const ideas = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^IDEA \d+:$/.test(lines[i].trim())) continue;
+    const json = (lines[i + 1] || '').trim();
+    if (!json.startsWith('{')) continue;
+    try {
+      ideas.push(JSON.parse(json));
+    } catch {
+      /* an unparseable idea is skipped; the engine falls back to a solo call */
+    }
+  }
+  return ideas.length ? { directive, expected: Number(marker[1]), ideas } : null;
+}
+
 function parseExtractLines(prompt) {
   const lines = (prompt || '').split('\n').filter((l) => l.startsWith('- '));
   return lines.map((l) => {
@@ -191,7 +229,9 @@ export const demoProvider = {
     const spec = MODELS.find((m) => m.id === model) || MODELS[0];
     const seed = hashString(`${role}|${prompt.slice(0, 4000)}|${model}`);
     const rng = seededRandom(seed);
-    const payload = this._compose(role, prompt, rng, schema);
+    // Batched evaluation: only when the schema asks for an `evaluations` array.
+    const batch = role === 'evaluator' && schema?.properties?.evaluations ? parseBatchEvalPrompt(prompt) : null;
+    const payload = batch ? this._evaluationBatch(batch, model) : this._compose(role, prompt, rng, schema);
     const text = JSON.stringify(payload);
 
     const arrayKey = itemArrayKey !== undefined ? itemArrayKey : firstArrayKey(schema);
@@ -199,7 +239,12 @@ export const demoProvider = {
 
     // stream it in token-sized chunks so the incremental pipeline is exercised
     const chunkSize = 26;
-    const perChunkMs = (spec.latency * 5) / Math.max(1, chunkSize / 26);
+    // Without this, stream length would stand in for cost and a batch would look
+    // exactly K times more expensive than K solo calls - which is the one thing
+    // batching is not. See BATCH_COST_PER_EXTRA_IDEA.
+    const k = batch ? batch.ideas.length : 1;
+    const costScale = k > 1 ? (1 + BATCH_COST_PER_EXTRA_IDEA * (k - 1)) / k : 1;
+    const perChunkMs = ((spec.latency * 5) / Math.max(1, chunkSize / 26)) * costScale;
     let acc = '';
     const started = Date.now();
     for (let i = 0; i < text.length; i += chunkSize) {
@@ -302,6 +347,29 @@ export const demoProvider = {
       });
     }
     return out;
+  },
+
+  /**
+   * Batched evaluation, simulator edition.
+   *
+   * Each idea is judged with the SAME seed the single-idea path would use, so
+   * here batching is score-neutral by construction. That is deliberate and it is
+   * the honest choice: a simulator cannot reproduce a real model's
+   * cross-contamination (ranking sibling ideas, curving scores to spread them),
+   * and inventing a difference would be a fabricated result. The demo therefore
+   * measures what it can - throughput, latency, queue wait, and proof that the
+   * deterministic guards apply identically at every K. For the real quality
+   * comparison, run `node scripts/bench-k.mjs` against your own Ollama model.
+   */
+  _evaluationBatch({ directive, ideas }, model) {
+    const evaluations = ideas.map((idea, i) => {
+      // Rebuild the exact single-idea prompt, then seed from it the same way
+      // complete() does. Identical seed + identical idea => identical judgment.
+      const singlePrompt = buildEvaluatePrompt(idea, { calibrationDirective: directive });
+      const rng = seededRandom(hashString(`evaluator|${singlePrompt.slice(0, 4000)}|${model}`));
+      return { index: i + 1, ...this._evaluation(idea, rng) };
+    });
+    return { evaluations };
   },
 
   /**

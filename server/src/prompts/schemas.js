@@ -91,6 +91,35 @@ export const EVALUATE_SCHEMA = {
   additionalProperties: false,
 };
 
+/**
+ * Batched evaluation: K independent judgments in one call.
+ *
+ * Experimental throughput lever. `index` is required per entry so results can be
+ * matched back to their idea even if the model reorders or drops one - a missing
+ * index fails that idea alone, never the whole batch.
+ */
+export function batchEvaluateSchema(k) {
+  const n = Math.max(1, Math.min(8, Math.round(k) || 1));
+  return {
+    type: 'object',
+    properties: {
+      evaluations: {
+        type: 'array',
+        minItems: n,
+        maxItems: n,
+        items: {
+          type: 'object',
+          properties: { index: num(`1-${n}: which idea in the list this evaluation belongs to`), ...EVALUATE_SCHEMA.properties },
+          required: ['index', ...EVALUATE_SCHEMA.required],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['evaluations'],
+    additionalProperties: false,
+  };
+}
+
 export const ATTACK_SCHEMA = {
   type: 'object',
   properties: {

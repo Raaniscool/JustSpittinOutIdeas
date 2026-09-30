@@ -91,6 +91,91 @@ the model parallel slots (`OLLAMA_NUM_PARALLEL=4`, needs VRAM) and matching revi
 evaluation cheaper — shorter `num_ctx`, lower `num_predict`, a smaller evaluator model. The backlog and average
 wait in the strip tell you which side is losing.
 
+## Batched evaluation (experimental): K ideas per call
+
+**Default: one idea per evaluation call.** That is the most reliably calibrated thing a local model can do —
+nothing can leak between ideas, so no sibling can be ranked, curved, or used as a contrast to make another look
+better. `performance.evaluationsPerCall` (env `IDEALAB_EVAL_BATCH`, Settings → Throughput) can be raised to 2–4
+to judge several ideas in a single call. It is labelled experimental because the trade is real:
+
+| | K = 1 (default) | K = 2–4 |
+| --- | --- | --- |
+| Evaluator calls | one per idea | one per K ideas |
+| Review lag when review is the bottleneck | baseline | lower — fewer round trips and prefills |
+| Contamination risk | none | the model sees siblings and may rank/curve them |
+| Cost of one failed call | 1 idea needs a retry | K ideas need retries (mitigated below) |
+
+What makes K>1 safe to offer at all:
+
+* **One safeguard path.** `engine.#applyEvaluation()` is the only place a judgment becomes a stored evaluation.
+  The calibration audit, the evidence guards, the programmatic overall, dedupe, unusualness and stats all run
+  per idea through it, whether the judgment arrived alone or with three siblings. Batching shares a model call,
+  never a code path.
+* **The prompt forbids comparison** — "judge each one as if it were the only idea you ever saw", "do NOT rank,
+  curve, or spread their scores", with the same 5–6 anchor and the same per-idea instructions as the solo prompt.
+* **Per-idea failure isolation.** Each entry carries an `index`; anything missing, unparseable, or lost to a
+  failed call falls back to its own single-idea call. A bad batch costs extra tokens, not K lost ideas.
+* **Never batched:** deep-mode ideas (a deep pass is several calls with its own bounded concurrency), and ideas
+  destined for different models (one call can only go to one model).
+* **Reuse still applies first.** Cached and near-duplicate evaluations are served without spending a batch slot.
+* Results stream: each judgment is applied as it arrives, so the first idea of a batch is scored before the call
+  finishes.
+
+A worker only groups what is actually queued, so it waits a bounded moment for a burst to fill (150 ms after the
+last arrival, never more than 750 ms) — and only at K>1. At K=1 there is no added latency at all.
+
+### Measured
+
+`scripts/bench-k.mjs` judges **the same fixed set of ideas** at every K, with the eval cache cleared,
+near-duplicate reuse and dedupe off, and calibration state reset, so any difference is attributable to K alone.
+48 ideas, 2 review workers, demo provider:
+
+| K | evaluator calls | ideas/call | reviewed/min | avg review latency | p95 | queue wait avg | eval ms per idea |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 48 | 1.0 | 776 | 2.0s | 3.6s | 1.9s | 147 |
+| 2 | 24 | 2.0 | 1405 | 1.1s | 2.0s | 1.0s | 79 |
+| 3 | 16 | 3.0 | 1368 | 1.1s | 2.0s | 980ms | 81 |
+| 4 | 12 | 4.0 | 1390 | 1.1s | 1.9s | 919ms | 78 |
+
+(Repeated runs vary by 1–2% in `reviewed/min`: the simulator is CPU-bound in one thread. The call counts, the
+per-idea shares and the score columns are exact.)
+
+Score distribution and guard activity were **identical at every K**: mean 5.6, median 5.35, sd 1.11, min 3.9,
+max 9.5, ≥7 8.3%, ≥8 4.2%, ≥9 4.2%; 14 ideas adjusted, 43 adjustments, mean pull-down −0.43, 41 evidence caps,
+and the stored overall equalled its deterministic recomputation for all 48 ideas in all four runs.
+
+Three honest caveats about that table:
+
+1. **Identical scores on the demo provider are true by construction, and prove nothing about your model.** The
+   simulator judges each idea in a batch with the same seed it would use alone, because a simulator cannot
+   reproduce cross-contamination — inventing a difference would be a fabricated result. It does prove the
+   safeguards are shared. The quality question needs your model:
+   `IDEALAB_PROVIDER=ollama node scripts/bench-k.mjs --model <yours> --rounds 3`.
+2. **The demo is CPU-bound in one Node thread**, so wall-clock throughput saturates: K=2/3/4 land within noise
+   of each other even though call counts differ 2:1. Trust `eval calls`, `ideas/call` and `eval ms per idea`
+   there, not `reviewed/min`.
+3. **Saving calls is not automatically saving time.** The same 24-idea job over HTTP with 2 review workers:
+
+   | | K=1 | K=4 |
+   | --- | --- | --- |
+   | evaluator calls | 24 | 6 |
+   | eval ms per idea | 154.3 | 85.8 |
+   | reviewed/min | 45.2 | 44.8 |
+
+   Calls fell 4× and per-idea model time nearly halved — and throughput did not move, because *generation* was
+   the bottleneck in that run, not review. Batching only pays when review is the losing side of the two queues,
+   which is exactly the condition the backlog and average-wait numbers in the strip tell you about.
+
+### Deciding
+
+Run the benchmark on your own model with `--rounds 3` and read the **DRIFT vs K=1** table: `d mean` (inflation),
+`sd ratio` (compression below ~0.9 means scores are being squeezed together), `mean |d| per idea`, `rank corr`
+(did the ordering of your ideas change?) and `d >=8 pp` (are 8+ scores getting cheaper?). If the verdict column
+says `stable` and throughput genuinely improved, K=2 is a reasonable experiment. If it says `INFLATED` or
+`COMPRESSED`, leave `evaluationsPerCall` at 1 — that is what it is there for.
+
+---
+
 ## Why it is fast
 
 Speed is a feature here, because the product is *volume*. The metric that matters is **useful ideas per
@@ -102,7 +187,8 @@ minute**, not tokens per second.
 | **Incremental stream parsing** | Ideas are parsed out of the token stream one at a time and land on the wall before the call finishes. (`lib/jsonStream.js`, `providers/ollama.js`) |
 | **Batched generation** | One model call returns N ideas as a JSON array instead of N calls. |
 | **Structured output** | `format` = JSON schema. The model cannot spend tokens on prose and we never pay for a parse-retry loop. Falls back to `format:"json"` on older Ollama builds automatically. |
-| **Concurrent review workers** | Independent ideas are evaluated by a worker pool (default 3 — match `OLLAMA_NUM_PARALLEL`), separately bounded from deep actions. |
+| **Concurrent review workers** | Independent ideas are evaluated by a worker pool (default 2 — match `OLLAMA_NUM_PARALLEL`, never past it), separately bounded from deep actions. |
+| **Batched evaluation (experimental, off by default)** | One call can judge up to 4 ideas, cutting evaluator round trips when review is the bottleneck. Same per-idea safeguards; see above. |
 | **Stable system prompt** | Role prompts are byte-identical across calls so Ollama reuses its cached prompt prefix; everything variable goes in the user message. |
 | **Persistent keep-alive sockets** | A hand-rolled `node:http` agent pool keeps one connection warm for hundreds of requests (`lib/http.js`). |
 | **Resident weights** | `keep_alive` on every request + an explicit preload when the model changes, so the load cost is paid once. |
@@ -282,7 +368,8 @@ initial values:
 | `IDEALAB_PROVIDER` | `ollama` | `ollama` or `demo` |
 | `IDEALAB_MODEL` | *(auto)* | Model id; empty = smallest installed |
 | `IDEALAB_BATCH` | `6` | Ideas per generation call |
-| `IDEALAB_EVAL_CONCURRENCY` | `3` | Concurrent review workers (match `OLLAMA_NUM_PARALLEL`) |
+| `IDEALAB_EVAL_CONCURRENCY` | `2` | Concurrent review workers. Conservative on purpose: match `OLLAMA_NUM_PARALLEL`, never past it — IdeaLab will not raise it for you |
+| `IDEALAB_EVAL_BATCH` | `1` | **Experimental.** Ideas judged per evaluator call (1–4). 1 = the calibrated default; see *Batched evaluation* |
 | `IDEALAB_REVIEW_DEPTH` | `120` | Review backlog at which generation throttles until it drains to 60% |
 | `IDEALAB_DEEP_CONCURRENCY` | `2` | Concurrent deep actions (attack/improve), capped at the eval concurrency |
 | `IDEALAB_CTX_GEN` / `_CTX_EVAL` / `_CTX_DEEP` | `3072 / 2048 / 3072` | `num_ctx` per role |
@@ -295,7 +382,9 @@ initial values:
 
 Tuning for maximum useful ideas per minute: raise `IDEALAB_BATCH` and `IDEALAB_EVAL_CONCURRENCY` together
 (with `OLLAMA_NUM_PARALLEL` to match), drop to a smaller model, and keep `num_ctx` as small as the prompts
-allow.
+allow. Only reach for `IDEALAB_EVAL_BATCH` once the strip shows review losing to generation, and benchmark it on
+your own model first — it trades calibration confidence for calls, and the default exists because that trade is
+not obviously worth it.
 
 ---
 
@@ -332,7 +421,7 @@ GET    /events                       single SSE stream: snapshot, idea:new, idea
 ## Tests
 
 ```bash
-npm test              # 97 tests
+npm test              # 111 tests
 npm run test:unit     # scoring, calibration guards, colour ramp, stream parser, similarity, knowledge gating, UI render
 npm run test:pipeline # end-to-end pipeline against the synthetic provider
 npm run test:api      # HTTP + SSE integration against a real spawned server
@@ -344,9 +433,18 @@ previous one has been scored, a continuous job keeps producing while review trai
 at the backlog cap and released when review catches up, every idea records how long it waited, deep review also
 runs off the generation path, and unreviewed ideas are re-queued after a restart.
 
+`tests/batch-eval.test.js` pins the batched-evaluation experiment, including the properties that would silently
+break it: K=1 is the default and out-of-range values clamp back into 1–4; K=4 spends one call per four ideas;
+the same ideas score identically at K=1 and K=4; an evaluator that returns 9.5-with-no-evidence is pulled down
+by exactly the same adjustments in a batch as alone; a batch that comes back short loses no ideas; cache and
+near-duplicate reuse still apply; deep-mode and different-model ideas are never grouped; judgments are applied
+as they stream; a failed batch falls back to single calls; a staggered burst still shares one call; and
+`drain()` never resolves while a batch is mid-flight.
+
 ```bash
 node scripts/bench-pipeline.mjs 36 4     # blocked vs decoupled against a P-slot stub backend
 node scripts/bench-throughput.mjs 60 3   # the same comparison through the demo provider
+node scripts/bench-k.mjs                 # K=1..4 on one fixed idea set: speed AND score quality
 ```
 
 The suite asserts the things that matter: the overall score equals its deterministic recomputation, the
@@ -388,6 +486,14 @@ data/                     your ideas, knowledge bank and settings (gitignored, l
   however fast ideas arrive. If the strip shows the backlog growing and the average wait climbing, either give
   the model parallel slots (`OLLAMA_NUM_PARALLEL`, plus matching review workers) or make each evaluation
   cheaper — smaller `num_ctx`, lower `num_predict`, a smaller evaluator model.
+* Batched evaluation (`IDEALAB_EVAL_BATCH`) is **experimental and off by default** for a reason: a model that
+  sees four ideas at once may rank them against each other and spread the scores. IdeaLab mitigates that — the
+  prompt forbids comparison, the deterministic guards run per idea through one shared code path, and a short
+  batch falls back to single calls — but no mitigation is proof. Benchmark it on your own model
+  (`node scripts/bench-k.mjs --rounds 3`) and trust the drift table over the throughput table. The demo provider
+  cannot answer this question at all: it scores batched ideas identically to solo ones by construction.
+* Batching saves calls, and calls are not the same thing as minutes. It only helps when review is the
+  bottleneck; when generation is, it changes nothing except adding a small gather delay.
 * The backlog cap is a real limit, not a bug. At `IDEALAB_REVIEW_DEPTH` (default 120) the generator waits for
   review to drain to 60%. That is deliberate: an unbounded queue means ideas scored minutes after they were
   generated, against a calibration window that no longer reflects what is on screen.

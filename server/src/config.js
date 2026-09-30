@@ -14,6 +14,11 @@ export const DATA_DIR = process.env.IDEALAB_DATA_DIR
   : path.join(ROOT, 'data');
 
 const envInt = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
+/** envInt with hard bounds, for knobs where an out-of-range value is a mistake. */
+const envIntClamped = (v, d, lo, hi) => {
+  const n = envInt(v, d);
+  return Math.max(lo, Math.min(hi, Math.round(n)));
+};
 const envFloat = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
 
 export const DEFAULT_SETTINGS = {
@@ -35,7 +40,16 @@ export const DEFAULT_SETTINGS = {
     ideasPerGenerationCall: envInt(process.env.IDEALAB_BATCH, 6), // batch generation
     // Review (evaluation) workers. This is the queue that scores ideas after the
     // generator has moved on - it no longer gates generation.
-    evaluateConcurrency: envInt(process.env.IDEALAB_EVAL_CONCURRENCY, 3),
+    // Conservative default on purpose: IdeaLab never raises OLLAMA_NUM_PARALLEL
+    // for you, so it must not assume parallel slots you have not configured.
+    // Raise it to match your OLLAMA_NUM_PARALLEL, not past it.
+    evaluateConcurrency: envInt(process.env.IDEALAB_EVAL_CONCURRENCY, 2),
+    // EXPERIMENTAL: ideas judged per evaluator call (1-4). 1 is the default
+    // because it is the most reliably calibrated - nothing can leak between
+    // ideas. K>1 cuts evaluator calls (and review lag when the model server has
+    // spare slots) but risks cross-contamination between ideas sharing a prompt.
+    // Compare on your own model with: node scripts/bench-k.mjs
+    evaluationsPerCall: envIntClamped(process.env.IDEALAB_EVAL_BATCH, 1, 1, 4),
     // How far review may fall behind generation before the generator waits.
     maxReviewDepth: envInt(process.env.IDEALAB_REVIEW_DEPTH, 120),
     // deep mode only: attack + improve (+ children) per idea, bounded separately

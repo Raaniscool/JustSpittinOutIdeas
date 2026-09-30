@@ -91,13 +91,24 @@ export function createApp() {
 }
 
 /** Validate + apply a settings patch from the UI. */
+/** round+clamp that treats anything non-numeric as "use the fallback". */
+function clampInt(value, fallback, lo, hi) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return clamp(fallback, lo, hi);
+  return clamp(Math.round(n), lo, hi);
+}
+
 export function patchSettings(ctx, patch = {}) {
   const next = deepMerge(structuredClone(ctx.settingsStore.data), patch);
 
   // guard rails so a typo in the UI cannot brick the pipeline
   const p = next.performance || {};
   p.ideasPerGenerationCall = clamp(Math.round(p.ideasPerGenerationCall || 6), 1, 25);
-  p.evaluateConcurrency = clamp(Math.round(p.evaluateConcurrency || 3), 1, 16);
+  p.evaluateConcurrency = clampInt(p.evaluateConcurrency, 2, 1, 16);
+  // Experimental batching lever. Clamped hard to 1-4; anything invalid (a typo in
+  // the UI, a NaN from a bad PATCH) falls back to 1 = one idea per call = the
+  // calibrated default.
+  p.evaluationsPerCall = clampInt(p.evaluationsPerCall, 1, 1, 4);
   p.maxReviewDepth = clamp(Math.round(p.maxReviewDepth ?? 120), 4, 100000);
   p.generateConcurrency = clamp(Math.round(p.generateConcurrency || 1), 1, 8);
   p.numCtxGenerate = clamp(Math.round(p.numCtxGenerate || 3072), 512, 131072);

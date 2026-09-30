@@ -26,6 +26,14 @@ export class StatsCollector {
       evalMs: [],
       deepMs: [],
       reviewWaitMs: [], // generated -> review started (the decoupling lag)
+      // Evaluator model calls. A batched call covers K ideas, so at K>1
+      // evalCalls < evaluated: this is how many calls batching actually saved.
+      evalCalls: 0,
+      evalCallMs: 0,
+      evalCallFailed: 0,
+      evalBatchIdeas: 0,
+      evalBatches: 0,
+      evalBatchFallbacks: 0,
       scores: [],
       tokens: { prompt: 0, completion: 0 },
       tokensPerSec: [],
@@ -109,6 +117,27 @@ export class StatsCollector {
    * With generation decoupled this is the number that says whether review is
    * keeping up: it should stay in the low seconds, not grow without bound.
    */
+  /** One evaluator model call finished, covering `ideas` ideas (1 unless batched). */
+  noteEvalCall({ ms = 0, ideas = 1 } = {}) {
+    const s = this.session;
+    s.evalCalls++;
+    s.evalCallMs += ms;
+    s.evalBatchIdeas += ideas;
+    if (ideas > 1) s.evalBatches++;
+  }
+
+  /** A batched evaluation attempt's aftermath: single-idea fallbacks it needed. */
+  noteEvalBatch({ ideas = 0, calls = 0, fallbacks = 0, ms = 0 } = {}) {
+    if (fallbacks > 0) this.session.evalBatchFallbacks += fallbacks;
+    void ideas; void calls; void ms;
+  }
+
+  noteEvalCallFailure({ error = '' } = {}) {
+    this.session.evalCallFailed++;
+    this.calls.failed++;
+    void error;
+  }
+
   recordReviewWait({ ms }) {
     if (!Number.isFinite(ms)) return;
     const s = this.session;
@@ -157,6 +186,14 @@ export class StatsCollector {
       ideasPerMinute: round1(s.evaluated / minutes),
       generatedPerMinute: round1((s.generated + s.derived) / minutes),
       reviewedPerMinute: round1(s.evaluated / minutes),
+      // Evaluator calls vs evaluations: at K=1 they match; at K>1 the gap is
+      // exactly how many model calls batching saved.
+      evalCalls: s.evalCalls,
+      avgEvalCallMs: s.evalCalls ? Math.round(s.evalCallMs / s.evalCalls) : 0,
+      avgEvalBatchSize: s.evalCalls ? round1(s.evalBatchIdeas / s.evalCalls) : 0,
+      evalBatches: s.evalBatches,
+      evalCallFailed: s.evalCallFailed,
+      evalBatchFallbacks: s.evalBatchFallbacks,
       avgReviewWaitMs: avg(s.reviewWaitMs),
       maxReviewWaitMs: s.reviewWaitMs.length ? Math.round(Math.max(...s.reviewWaitMs)) : 0,
       usefulPerMinute: round2(ge(7) / minutes),

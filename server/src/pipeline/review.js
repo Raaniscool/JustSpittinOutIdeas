@@ -25,6 +25,25 @@ import { emit } from '../lib/bus.js';
 import { clamp, round1, sleep } from '../lib/util.js';
 import { IdeaRepository } from './ideas.js';
 
+/**
+ * Batch gathering, at K>1 only.
+ *
+ * A worker waits for a batch to fill the way a debounce works: keep waiting while
+ * ideas are still arriving, stop once they are not. Two bounds keep it honest.
+ *
+ *   BATCH_GATHER_IDLE_MS  stop waiting this long after the last arrival, so a
+ *                         quiet queue fires a partial batch instead of stalling
+ *   BATCH_GATHER_MAX_MS   never wait longer than this, whatever the arrival rate
+ *
+ * Batching earns its real keep when the review queue is deep - when evaluation
+ * cannot keep up with generation - and then groups fill with no waiting at all.
+ * These windows only catch ideas landing in the same burst. If your generator
+ * produces an idea every couple of seconds and review keeps up, nothing will
+ * batch and K=1 is simply the better setting: there is no backlog to amortise.
+ */
+const BATCH_GATHER_IDLE_MS = 150;
+const BATCH_GATHER_MAX_MS = 750;
+
 export class ReviewQueue {
   constructor({ engine, stats, getSettings = null, onDone = null, onEnqueue = null }) {
     this.engine = engine;
@@ -46,11 +65,21 @@ export class ReviewQueue {
 
     this.drainWaiters = [];
     this.jobWaiters = new Map();
+    this.lastEnqueueAt = 0;
   }
 
   // ------------------------------------------------------------- settings --
   get concurrency() {
     return clamp(Math.round(this.getSettings()?.performance?.evaluateConcurrency || 3), 1, 16);
+  }
+
+  /**
+   * EXPERIMENTAL: how many ideas one evaluator call may judge (1-4).
+   * 1 = the default, one idea per call. Read live so the setting can be compared
+   * without a restart.
+   */
+  get batchSize() {
+    return clamp(Math.round(this.getSettings()?.performance?.evaluationsPerCall || 1), 1, 4);
   }
 
   /** How far review is allowed to fall behind generation before we throttle. */
@@ -99,6 +128,7 @@ export class ReviewQueue {
       error: null,
     };
     this.queue.push(task);
+    this.lastEnqueueAt = Date.now(); // the batch gather window debounces on this
     emit('review:queued', {
       ideaId: task.ideaId,
       jobId: task.jobId,
@@ -154,17 +184,144 @@ export class ReviewQueue {
       if (this.stopped) return;
       while (this.paused && !this.stopped) await sleep(120);
       if (this.stopped) return;
-      const task = this.queue.shift();
-      if (!task) return;
-      this.inFlight.add(task);
+      await this.#awaitBatchFill();
+      // Shift and mark in flight in the same synchronous step: no yield between
+      // them, so drain() can never see a task that is in neither place.
+      const group = this.#takeGroup();
+      if (!group.length) return;
+      for (const task of group) this.inFlight.add(task);
       try {
-        await this.#run(task);
+        if (group.length === 1) await this.#run(group[0]);
+        else await this.#runBatch(group);
       } finally {
-        this.inFlight.delete(task);
+        for (const task of group) this.inFlight.delete(task);
       }
       this.#pump();
       this.#notify();
     }
+  }
+
+  /**
+   * Pull up to K tasks that can genuinely share one evaluator call.
+   *
+   * Only fast-mode tasks with the same model are grouped: a deep pass stays
+   * per-idea (it is several calls with its own bounded concurrency), and one call
+   * can only ever go to one model. At K=1 this is exactly the old behaviour.
+   */
+  /**
+   * Batching only pays off if the group actually fills, and ideas arrive in
+   * bursts, so at K>1 a worker waits a bounded moment for the rest of the burst.
+   *
+   * Tasks stay in the queue during the wait, so drain() and the backpressure
+   * accounting still see them. This is a separate method from #takeGroup on
+   * purpose: #takeGroup must stay synchronous, because an await between shifting
+   * a task off the queue and adding it to inFlight would leave it invisible to
+   * drain(), which could then resolve while work was still outstanding.
+   */
+  async #awaitBatchFill() {
+    const k = this.batchSize;
+    if (k <= 1 || this.stopped || this.paused) return;
+    const batchable = (task) => task.mode === 'fast';
+    const first = this.queue.find(batchable);
+    if (!first) return;
+    const ready = () => this.queue.filter((task) => this.#canShare(task, first)).length;
+    if (ready() >= k) return; // deep queue: the batch is already full
+    const deadline = Date.now() + BATCH_GATHER_MAX_MS;
+    while (!this.stopped && !this.paused && Date.now() < deadline && ready() < k) {
+      if (Date.now() - this.lastEnqueueAt > BATCH_GATHER_IDLE_MS) return; // arrivals stopped
+      await sleep(15);
+    }
+  }
+
+  /** Can these two tasks be judged in one evaluator call? Same mode, same model. */
+  #canShare(task, like) {
+    return task.mode === 'fast' && like?.mode === 'fast' && (task.model || '') === (like.model || '');
+  }
+
+  #takeGroup() {
+    const k = this.batchSize;
+    const first = this.queue.shift();
+    if (!first) return [];
+    if (k <= 1 || first.mode !== 'fast') return [first];
+    const group = [first];
+    for (let i = 0; i < this.queue.length && group.length < k; ) {
+      if (this.#canShare(this.queue[i], first)) group.push(this.queue.splice(i, 1)[0]);
+      else i++;
+    }
+    return group;
+  }
+
+  /**
+   * Batched review: one model call for up to K ideas, then the same per-idea
+   * finishing, failure marking and events as the single-idea path. scoreMany()
+   * falls back to single-idea calls for anything the batch did not return, so a
+   * bad batch costs extra tokens rather than K lost ideas.
+   */
+  async #runBatch(group) {
+    const startedAt = Date.now();
+    const tasks = [];
+    for (const task of group) {
+      const idea = this.engine.repo.get(task.ideaId);
+      if (!idea) {
+        this.#finish(task, { ok: false, error: 'idea no longer exists' });
+        continue;
+      }
+      task.startedAt = startedAt;
+      const waitedMs = startedAt - task.queuedAt;
+      this.waitMs.push(waitedMs);
+      if (this.waitMs.length > 400) this.waitMs.shift();
+      this.stats?.recordReviewWait?.({ ms: waitedMs, mode: task.mode });
+      emit('review:start', {
+        ideaId: task.ideaId,
+        jobId: task.jobId,
+        waitedMs,
+        depth: this.queue.length,
+        active: this.inFlight.size,
+        batch: group.length,
+      });
+      tasks.push({ task, idea });
+    }
+    if (!tasks.length) return;
+
+    try {
+      const res = await this.engine.scoreMany(
+        tasks.map((t) => t.idea),
+        { model: tasks[0].task.model, signal: this.signal, mode: 'fast' },
+      );
+      tasks.forEach(({ task, idea }, i) => {
+        const r = res.results?.[i];
+        const ok = !!r?.ok && idea.scoringState !== 'failed';
+        if (!ok && idea.scoringState !== 'failed') {
+          idea.scoringState = 'failed';
+          idea.error = r?.error || 'batched evaluation returned nothing for this idea';
+          this.engine.repo.update(task.ideaId, { scoringState: 'failed', error: idea.error });
+          this.stats?.recordEvaluation?.({ failed: true, model: task.model, ms: 0 });
+          emit('idea:updated', { card: IdeaRepository.card(idea), error: idea.error, jobId: task.jobId });
+        }
+        this.#finish(task, { ok, overall: idea.score?.overall ?? null, error: ok ? null : idea.error || r?.error || 'evaluation failed' });
+      });
+    } catch (err) {
+      const aborted = err?.message === 'aborted' || this.signal.aborted;
+      for (const { task, idea } of tasks) this.#fail(task, idea, err, aborted);
+    }
+  }
+
+  /** Shared abort/failure handling, so batched and single review behave alike. */
+  #fail(task, idea, err, aborted) {
+    if (aborted) {
+      // Interrupted, not broken: leave it pending so a restart picks it up.
+      idea.scoringState = 'queued';
+      delete idea.error;
+      this.engine.repo.update(task.ideaId, { scoringState: 'queued', error: null });
+      emit('idea:updated', { card: IdeaRepository.card(idea), jobId: task.jobId });
+    } else {
+      idea.scoringState = 'failed';
+      idea.error = err.message;
+      this.engine.repo.update(task.ideaId, { scoringState: 'failed', error: err.message });
+      this.stats?.recordEvaluation?.({ failed: true, model: task.model, ms: 0 });
+      emit('idea:updated', { card: IdeaRepository.card(idea), error: err.message, jobId: task.jobId });
+    }
+    this.#finish(task, { ok: false, error: aborted ? 'aborted' : err.message, aborted });
   }
 
   async #run(task) {
@@ -199,21 +356,7 @@ export class ReviewQueue {
         error: idea.error || null,
       });
     } catch (err) {
-      const aborted = err?.message === 'aborted' || this.signal.aborted;
-      if (aborted) {
-        // Interrupted, not broken: leave it pending so a restart picks it up.
-        idea.scoringState = 'queued';
-        delete idea.error;
-        this.engine.repo.update(task.ideaId, { scoringState: 'queued', error: null });
-        emit('idea:updated', { card: IdeaRepository.card(idea), jobId: task.jobId });
-      } else {
-        idea.scoringState = 'failed';
-        idea.error = err.message;
-        this.engine.repo.update(task.ideaId, { scoringState: 'failed', error: err.message });
-        this.stats?.recordEvaluation?.({ failed: true, model: task.model, ms: 0 });
-        emit('idea:updated', { card: IdeaRepository.card(idea), error: err.message, jobId: task.jobId });
-      }
-      this.#finish(task, { ok: false, error: aborted ? 'aborted' : err.message, aborted });
+      this.#fail(task, idea, err, err?.message === 'aborted' || this.signal.aborted);
     }
   }
 
@@ -381,6 +524,8 @@ export class ReviewQueue {
       depth: this.queue.length,
       active: this.inFlight.size,
       concurrency: this.concurrency,
+      // Experimental batching: ideas judged per evaluator call (1 = default).
+      batchSize: this.batchSize,
       maxDepth: this.maxDepth,
       resumeDepth: this.resumeDepth,
       paused: this.paused,

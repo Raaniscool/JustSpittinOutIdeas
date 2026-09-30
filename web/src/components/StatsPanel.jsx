@@ -42,7 +42,9 @@ export default function StatsPanel({ stats, calibration, distribution, evalCache
         <Big
           label="Reviewed / minute"
           value={s.reviewedPerMinute ?? s.ideasPerMinute ?? 0}
-          sub={`review queue: ${reviews?.depth ?? 0} waiting · ${reviews?.active ?? 0} in flight · avg wait ${ms(reviews?.avgWaitMs ?? s.avgReviewWaitMs ?? 0)}`}
+          sub={`review queue: ${reviews?.depth ?? 0} waiting · ${reviews?.active ?? 0} in flight · avg wait ${ms(reviews?.avgWaitMs ?? s.avgReviewWaitMs ?? 0)}${
+            s.evalCalls ? ` · ${s.evalCalls} evaluator call${s.evalCalls === 1 ? '' : 's'}${s.avgEvalBatchSize > 1 ? ` for ${s.avgEvalBatchSize} ideas each` : ''}` : ''
+          }`}
           color={(reviews?.throttled || (reviews?.avgWaitMs ?? 0) > 30000) ? 'var(--warn)' : undefined}
         />
         <Big
@@ -52,7 +54,16 @@ export default function StatsPanel({ stats, calibration, distribution, evalCache
           color="var(--accent-2)"
         />
         <Big label="Average generation" value={ms(s.avgGenerationMs)} sub="per batched model call" />
-        <Big label="Average evaluation" value={ms(s.avgEvaluationMs)} sub="per idea, wall-clock including queueing" />
+        <Big
+          label="Average evaluation"
+          value={ms(s.avgEvaluationMs)}
+          sub={
+            s.avgEvalBatchSize > 1
+              ? `per idea, its share of a ${s.avgEvalBatchSize}-idea call averaging ${ms(s.avgEvalCallMs)}`
+              : 'per idea, one evaluator call each'
+          }
+          color={s.avgEvalBatchSize > 1 ? 'var(--warn)' : undefined}
+        />
         <Big label="Average deep action" value={ms(s.avgDeepActionMs)} sub={Object.entries(s.deepActions || {}).map(([k, v]) => `${k} ${v}`).join(' · ') || 'none run'} />
         <Big
           label="Average score"

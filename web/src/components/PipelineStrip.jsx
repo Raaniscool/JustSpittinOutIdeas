@@ -12,6 +12,7 @@ import { ms } from '../lib/format.js';
  */
 export default function PipelineStrip({ stats, reviews, generating, onPauseReviews, onResumeReviews, onClearReviews, onRequeueReviews }) {
   const r = reviews || {};
+  const batch = r.batchSize ?? 1;
   const s = stats || {};
   const depth = r.depth ?? 0;
   const active = r.active ?? 0;
@@ -70,7 +71,15 @@ export default function PipelineStrip({ stats, reviews, generating, onPauseRevie
           <b>{s.reviewedPerMinute ?? 0} reviewed/min</b>
           <span className="muted">
             {s.ideasEvaluated ?? 0} scored · ≥7: {s.countGe7 ?? 0}
+            {batch > 1 ? ` · ${batch} ideas/eval call` : ''}
           </span>
+          {batch > 1 && (
+            // An experimental setting that changes how ideas are judged should not
+            // be invisible while it is on.
+            <span className="chip warn" title="Experimental: several ideas are judged in one evaluator call. The prompt forbids comparing them and the deterministic guards still run per idea, but only your own model can tell you whether scores drift - run node scripts/bench-k.mjs. Set Ideas per evaluation call back to 1 for the calibrated default.">
+              experimental batching on
+            </span>
+          )}
         </div>
       </div>
 

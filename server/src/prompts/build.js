@@ -68,6 +68,39 @@ export function buildEvaluatePrompt(idea, { calibrationDirective = '' } = {}) {
   return parts.join('\n');
 }
 
+/**
+ * K ideas in one evaluator call.
+ *
+ * The whole risk of batching is contamination: a model that sees four ideas at
+ * once tends to rank them against each other and spread the scores, which is
+ * exactly the inflation/curving the calibration guards fight. So the prompt
+ * forbids comparison explicitly and keeps the identical per-idea instruction and
+ * anchor as the single-idea prompt. The deterministic guards then apply per idea
+ * exactly as they do at K=1.
+ */
+export function buildBatchEvaluatePrompt(ideas = [], { calibrationDirective = '' } = {}) {
+  const parts = [];
+  if (calibrationDirective) parts.push(calibrationDirective);
+  parts.push(`EVALUATE EACH OF THE FOLLOWING ${ideas.length} IDEAS INDEPENDENTLY.`);
+  parts.push(
+    'They are listed together only to save a round trip. Judge each one on its own merits, against the standard you would apply if it were the only idea you ever saw.',
+  );
+  parts.push(
+    'Do NOT compare them to each other. Do NOT rank, curve, or spread their scores to make them differ. Do NOT let the position of an idea in this list affect its score. Two equally weak ideas must both score low; two equally strong ideas must both score high.',
+  );
+  ideas.forEach((idea, i) => {
+    parts.push(`IDEA ${i + 1}:`);
+    parts.push(JSON.stringify(compactIdea(idea)));
+  });
+  parts.push(
+    'Score all 10 factors for every idea. Ordinary-but-competent = 5-6. Every factor needs a concrete one-sentence "why". Include whyNotHigher and priorArt for each.',
+  );
+  parts.push(
+    `Return {"evaluations":[...]} with exactly ${ideas.length} entries, one per idea, each carrying its "index" (${ideas.map((_x, i) => i + 1).join(', ')}). JSON only.`,
+  );
+  return parts.join('\n');
+}
+
 export function buildAttackPrompt(idea, evaluation) {
   const parts = ['IDEA:', JSON.stringify(compactIdea(idea))];
   if (evaluation) {

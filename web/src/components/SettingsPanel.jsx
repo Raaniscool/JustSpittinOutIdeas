@@ -96,7 +96,9 @@ export default function SettingsPanel({ settings, onPatch, onReset, health, onPr
           <Num label="Ideas per generation call" value={perf.ideasPerGenerationCall} onChange={(v) => setPerf({ ideasPerGenerationCall: v })} min={1} max={25}
             hint="Batching amortises prompt processing. Too high and small models lose coherence." />
           <Num label="Concurrent review workers" value={perf.evaluateConcurrency} onChange={(v) => setPerf({ evaluateConcurrency: v })} min={1} max={16}
-            hint="Evaluations run on their own queue, so this no longer gates generation. Match OLLAMA_NUM_PARALLEL; higher scores more ideas per minute until the GPU saturates." />
+            hint="Evaluations run on their own queue, so this no longer gates generation. Defaults to 2 on purpose: IdeaLab never raises OLLAMA_NUM_PARALLEL for you, so set this to match the slots you configured, not past them." />
+          <Num label="Ideas per evaluation call (experimental)" value={perf.evaluationsPerCall ?? 1} onChange={(v) => setPerf({ evaluationsPerCall: v })} min={1} max={4}
+            hint="EXPERIMENTAL. 1 = one idea per evaluator call, the default and the most reliably calibrated: nothing can leak between ideas. 2-4 judges several ideas in one call - fewer calls and less review lag, but a model seeing siblings may rank or curve them. The prompt forbids that and the deterministic guards still run per idea, yet only your own model can tell you whether scores drift: run node scripts/bench-k.mjs to compare K=1..4 on the same ideas before trusting it." />
           <Num label="Max review backlog" value={perf.maxReviewDepth ?? 120} onChange={(v) => setPerf({ maxReviewDepth: v })} min={4} max={5000}
             hint="How far review may fall behind generation. At the cap the generator waits for the backlog to drain to 60%, so memory and staleness stay bounded." />
           <Num label="Concurrent deep actions" value={perf.deepConcurrency ?? 2} onChange={(v) => setPerf({ deepConcurrency: v })} min={1} max={8}

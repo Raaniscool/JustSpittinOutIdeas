@@ -10,6 +10,7 @@ import path from 'node:path';
 import { createApp, shutdown } from './app.js';
 import { apiRouter } from './routes/api.js';
 import { bus, emit } from './lib/bus.js';
+import net from 'node:net';
 import { HOST, PORT, ROOT } from './config.js';
 import { getProvider } from './providers/index.js';
 import { IdeaRepository } from './pipeline/ideas.js';
@@ -114,7 +115,25 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: err.message });
 });
 
-const server = app.listen(PORT, HOST, async () => {
+/**
+ * Bind the server. `HOST` unset means "everywhere", and on a dual-stack machine
+ * that has to include IPv6: browsers that resolve `localhost` to ::1 first got a
+ * connection refused when we listened on 0.0.0.0 only. `::` accepts both families.
+ */
+function bind(port, host, onReady) {
+  if (!host) return app.listen(port, '::', onReady);
+  const server = app.listen(port, host, onReady);
+  if (net.isIPv4(host) && (host === '0.0.0.0' || host === '127.0.0.1')) {
+    // Best-effort IPv6 twin so ::1 works too. Ignored if the stack has no IPv6
+    // or the port is already taken there.
+    const v6 = app.listen(port, '::1');
+    v6.on('error', () => v6.close());
+    server.on('close', () => v6.close());
+  }
+  return server;
+}
+
+const server = bind(PORT, HOST, async () => {
   const provider = getProvider(ctx.settingsStore.data.provider);
   const ping = await provider.ping?.().catch((e) => ({ reachable: false, error: e.message }));
   const model = ctx.settingsStore.data.model || (await ctx.engine.resolveModel());

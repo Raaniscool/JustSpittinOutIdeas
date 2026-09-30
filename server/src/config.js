@@ -123,5 +123,6 @@ export const IDEA_STATUSES = ['new', 'starred', 'researching', 'building', 'arch
 export const DEEP_ACTIONS = ['improve', 'mutate', 'attack', 'develop', 'research', 'reevaluate'];
 
 export const PORT = envInt(process.env.PORT, 8787);
-export const HOST = process.env.HOST || '0.0.0.0';
+// '' = every interface, dual-stack (IPv4 + IPv6). Set HOST=0.0.0.0 to force IPv4.
+export const HOST = process.env.HOST || '';
 export const PROMPT_VERSION = 'idealab-prompts-v3';

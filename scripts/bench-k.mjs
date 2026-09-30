@@ -145,6 +145,25 @@ const model = await ctx.engine.resolveModel(MODEL);
 const engine = ctx.engine;
 const reviews = ctx.reviews;
 
+// Fail fast on a typo'd model. resolveModel() passes an explicit id through
+// unchecked, so a missing model would otherwise surface as a wall of per-call
+// failures halfway through a long benchmark run.
+try {
+  const installed = (await engine.provider().listModels?.()) || [];
+  const ids = installed.map((m) => m.id || m.name).filter(Boolean);
+  if (ids.length && model && !ids.includes(model)) {
+    console.error(`\nmodel "${model}" is not installed. Available: ${ids.join(', ')}`);
+    console.error('(run `node scripts/ollama-check.mjs` to see what Ollama reports)');
+    await shutdown(ctx);
+    fs.rmSync(dir, { recursive: true, force: true });
+    process.exit(1);
+  }
+} catch (err) {
+  // An unreachable model server is worth a warning, not a hard stop: the runs
+  // themselves will report the failures with their real cause.
+  console.log(`warning: could not list installed models (${err?.message || err}) - continuing`);
+}
+
 // ------------------------------------------------------- the idea set -----
 /** The fixed set every K is judged on. Generated once, reused for all runs. */
 async function buildIdeaSet(count) {
